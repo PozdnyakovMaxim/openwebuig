@@ -7,6 +7,7 @@ SYSTEM_PROMPT = """Ты отвечаешь на вопросы по предос
 Используй только предоставленные источники.
 Если в источниках нет ответа, прямо скажи: "В найденных документах ответа нет."
 Каждый существенный тезис подкрепляй ссылкой вида [1], [2].
+Если вопрос уточняющий, используй историю диалога только для понимания текущего вопроса.
 Не выдумывай номера разделов, даты, роли и обязанности."""
 
 
@@ -27,9 +28,27 @@ def format_sources(rows: list[dict[str, Any]], *, max_chars_per_source: int = 14
     return "\n\n".join(parts)
 
 
-def build_messages(query: str, rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+def format_chat_history(history: list[dict[str, str]], *, max_chars_per_message: int = 800) -> str:
+    role_names = {"user": "Пользователь", "assistant": "Ассистент"}
+    lines: list[str] = []
+    for item in history:
+        content = " ".join(str(item["content"]).split())
+        if len(content) > max_chars_per_message:
+            content = content[: max_chars_per_message - 1].rstrip() + "..."
+        lines.append(f"{role_names.get(item['role'], item['role'])}: {content}")
+    return "\n".join(lines)
+
+
+def build_messages(
+    query: str,
+    rows: list[dict[str, Any]],
+    *,
+    chat_history: list[dict[str, str]] | None = None,
+) -> list[dict[str, str]]:
     sources = format_sources(rows)
-    user_prompt = f"Вопрос: {query}\n\nИсточники:\n{sources}\n\nОтветь кратко, по делу, с цитатами."
+    history = format_chat_history(chat_history or [])
+    history_block = f"История диалога:\n{history}\n\n" if history else ""
+    user_prompt = f"{history_block}Текущий вопрос: {query}\n\nИсточники:\n{sources}\n\nОтветь кратко, по делу, с цитатами."
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},

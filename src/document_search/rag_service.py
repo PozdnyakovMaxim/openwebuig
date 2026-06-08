@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from .answering import build_messages, extractive_answer
+from .chat_history import build_retrieval_query
 from .pgvector_store import connect, database_url
 from .provider_api import make_chat, make_embedder
 from .retriever import hybrid_search
@@ -39,21 +40,23 @@ def answer_question(
     embed_model: str | None = None,
     chat_provider: str | None = None,
     chat_model: str | None = None,
+    chat_history: list[dict[str, str]] | None = None,
     limit: int = 6,
     extractive: bool = False,
     temperature: float = 0.0,
 ) -> RagAnswer:
     load_env_file()
+    search_query = build_retrieval_query(query, chat_history)
     embedder = make_embedder(
         provider=embed_provider,
         provider_api_base_url=provider_api_base_url,
         provider_api_key=provider_api_key,
         model=embed_model,
     )
-    embedding = embedder.embed_text(query)
+    embedding = embedder.embed_text(search_query)
 
     with connect(database_url(database_url_override)) as conn:
-        rows = hybrid_search(conn, query=query, embedding=embedding, limit=limit)
+        rows = hybrid_search(conn, query=search_query, embedding=embedding, limit=limit)
 
     sources = [str(row["citation_label"]) for row in rows]
     if extractive or not has_chat_config(chat_provider, chat_model):
@@ -73,7 +76,7 @@ def answer_question(
     )
     return RagAnswer(
         query=query,
-        answer=chat.complete(build_messages(query, rows), temperature=temperature),
+        answer=chat.complete(build_messages(query, rows, chat_history=chat_history), temperature=temperature),
         sources=sources,
         rows=rows,
         mode="generated",

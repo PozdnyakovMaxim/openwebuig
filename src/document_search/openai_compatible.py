@@ -10,6 +10,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from .chat_history import content_to_text, normalize_history
 from .pgvector_store import connect, count_rows, database_url
 from .rag_service import answer_question, append_sources
 from .settings import load_env_file
@@ -72,10 +73,13 @@ def chat_completions(
         raise HTTPException(status_code=400, detail="No user message was provided.")
 
     limit = int(os.getenv("RAG_RETRIEVAL_LIMIT") or "6")
+    chat_history_limit = int(os.getenv("RAG_CHAT_HISTORY_LIMIT") or "8")
+    chat_history = normalize_history(request.messages, max_messages=chat_history_limit)
     force_extractive = _env_bool("RAG_FORCE_EXTRACTIVE", False)
     rag_answer = answer_question(
         query,
         limit=limit,
+        chat_history=chat_history,
         extractive=force_extractive,
         temperature=float(request.temperature or 0.0),
     )
@@ -123,27 +127,10 @@ def _check_auth(authorization: str | None) -> None:
 def _last_user_text(messages: list[ChatMessage]) -> str:
     for message in reversed(messages):
         if message.role == "user":
-            return _content_to_text(message.content)
+            return content_to_text(message.content)
     if messages:
-        return _content_to_text(messages[-1].content)
+        return content_to_text(messages[-1].content)
     return ""
-
-
-def _content_to_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                if item.get("type") == "text" and item.get("text"):
-                    parts.append(str(item["text"]))
-                elif item.get("content"):
-                    parts.append(str(item["content"]))
-            elif item:
-                parts.append(str(item))
-        return "\n".join(parts).strip()
-    return str(content or "").strip()
 
 
 def _stream_completion(*, response_id: str, created: int, model: str, content: str):
