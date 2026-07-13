@@ -10,10 +10,10 @@ from .answering import build_messages, extractive_answer
 from .chat_history import build_retrieval_query
 from .pgvector_store import connect, database_url, list_documents
 from .provider_api import make_chat, make_embedder
+from .query_router import RouteDecision, route_query
 from .retriever import hybrid_search
 from .service_queries import (
     capabilities_answer,
-    classify_service_query,
     documents_answer,
     identity_answer,
 )
@@ -56,19 +56,31 @@ def answer_question(
 ) -> RagAnswer:
     started = time.perf_counter()
     load_env_file()
-    service_route = classify_service_query(query)
+    chat = None
+    routing_started = time.perf_counter()
+    if has_chat_config(chat_provider, chat_model):
+        chat = make_chat(
+            provider=chat_provider,
+            provider_api_base_url=provider_api_base_url,
+            provider_api_key=provider_api_key,
+            model=chat_model,
+        )
+        decision = route_query(chat, query, chat_history=chat_history)
+    else:
+        decision = RouteDecision(route="rag")
+    routing_ms = _elapsed_ms(routing_started)
+    service_route = decision.route
+
     if service_route == "identity":
-        return _service_answer(query, identity_answer(), service_route, started)
+        return _service_answer(query, identity_answer(), service_route, started, routing_ms=routing_ms)
     if service_route == "capabilities":
-        return _service_answer(query, capabilities_answer(), service_route, started)
+        return _service_answer(query, capabilities_answer(), service_route, started, routing_ms=routing_ms)
     if service_route == "documents":
         database_started = time.perf_counter()
         with connect(database_url(database_url_override)) as conn:
-            documents, total = list_documents(
-                conn,
-                limit=int(os.getenv("RAG_DOCUMENT_LIST_LIMIT") or "200"),
-            )
+            documents, total = list_documents(conn)
         timings = {
+            "routing": routing_ms,
             "database": _elapsed_ms(database_started),
             "total": _elapsed_ms(started),
         }
@@ -80,6 +92,15 @@ def answer_question(
             mode="service",
             route="documents",
             timings_ms=timings,
+        )
+    if service_route == "general":
+        return _service_answer(
+            query,
+            decision.answer,
+            service_route,
+            started,
+            routing_ms=routing_ms,
+            mode="generated",
         )
 
     retrieval_query_started = time.perf_counter()
@@ -112,6 +133,7 @@ def answer_question(
             rows=rows,
             mode="extractive",
             timings_ms={
+                "routing": routing_ms,
                 "query": retrieval_query_ms,
                 "embedding": embedding_ms,
                 "search": search_ms,
@@ -120,12 +142,13 @@ def answer_question(
             },
         )
 
-    chat = make_chat(
-        provider=chat_provider,
-        provider_api_base_url=provider_api_base_url,
-        provider_api_key=provider_api_key,
-        model=chat_model,
-    )
+    if chat is None:
+        chat = make_chat(
+            provider=chat_provider,
+            provider_api_base_url=provider_api_base_url,
+            provider_api_key=provider_api_key,
+            model=chat_model,
+        )
     generation_started = time.perf_counter()
     answer = chat.complete(build_messages(query, rows, chat_history=chat_history), temperature=temperature)
     return RagAnswer(
@@ -135,6 +158,7 @@ def answer_question(
         rows=rows,
         mode="generated",
         timings_ms={
+            "routing": routing_ms,
             "query": retrieval_query_ms,
             "embedding": embedding_ms,
             "search": search_ms,
@@ -157,15 +181,26 @@ def append_sources(answer: RagAnswer) -> str:
     return "\n".join(lines)
 
 
-def _service_answer(query: str, answer: str, route: str, started: float) -> RagAnswer:
+def _service_answer(
+    query: str,
+    answer: str,
+    route: str,
+    started: float,
+    *,
+    routing_ms: float,
+    mode: str = "service",
+) -> RagAnswer:
     return RagAnswer(
         query=query,
         answer=answer,
         sources=[],
         rows=[],
-        mode="service",
+        mode=mode,
         route=route,
-        timings_ms={"total": _elapsed_ms(started)},
+        timings_ms={
+            "routing": routing_ms,
+            "total": _elapsed_ms(started),
+        },
     )
 
 

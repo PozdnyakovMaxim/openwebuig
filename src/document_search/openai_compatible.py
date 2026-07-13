@@ -181,7 +181,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _timing_headers(route: str, timings_ms: dict[str, float]) -> dict[str, str]:
     metrics = []
-    for name in ("query", "embedding", "search", "database", "generation", "total"):
+    for name in ("routing", "query", "embedding", "search", "database", "generation", "total"):
         if name in timings_ms:
             metrics.append(f"{name};dur={timings_ms[name]:.2f}")
     return {

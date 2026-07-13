@@ -1,39 +1,5 @@
 from __future__ import annotations
 
-import re
-
-
-IDENTITY_PATTERNS = (
-    r"кто\s+ты",
-    r"ты\s+кто",
-    r"что\s+ты\s+такое",
-    r"как\s+тебя\s+зовут",
-    r"представься",
-)
-CAPABILITY_PATTERNS = (
-    r"что\s+ты\s+умеешь",
-    r"что\s+можешь",
-    r"чем\s+ты\s+можешь\s+помочь",
-    r"какие\s+у\s+тебя\s+возможности",
-)
-DOCUMENT_PATTERNS = (
-    r"(?:покажи|дай|выведи|перечисли)(?:\s+мне)?(?:\s+все)?(?:\s+доступные|\s+проиндексированные)?\s+документы",
-    r"(?:список|перечень)\s+документов",
-    r"(?:с\s+какими|по\s+каким|какие)\s+документ(?:ами|ы).*?(?:работаешь|доступны|есть\s+в\s+базе|проиндексированы)",
-)
-
-
-def classify_service_query(query: str) -> str | None:
-    normalized = " ".join(query.lower().replace("ё", "е").split()).strip(" .!?;:")
-    if any(re.fullmatch(pattern, normalized) for pattern in IDENTITY_PATTERNS):
-        return "identity"
-    if any(re.fullmatch(pattern, normalized) for pattern in CAPABILITY_PATTERNS):
-        return "capabilities"
-    if any(re.fullmatch(pattern, normalized) for pattern in DOCUMENT_PATTERNS):
-        return "documents"
-    return None
-
-
 def identity_answer() -> str:
     return (
         "Я ГлавстройLLM, внутренний ассистент для помощи сотрудникам и специалистам "

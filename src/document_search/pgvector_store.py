@@ -226,17 +226,18 @@ def count_rows(conn: Any) -> dict[str, int]:
     return {"documents": int(documents), "chunks": int(chunks)}
 
 
-def list_documents(conn: Any, *, limit: int = 200) -> tuple[list[dict[str, Any]], int]:
+def list_documents(conn: Any, *, limit: int | None = None) -> tuple[list[dict[str, Any]], int]:
     total = int(conn.execute("SELECT count(*) AS value FROM doc_documents").fetchone()["value"])
-    rows = conn.execute(
-        """
+    query = """
         SELECT source_name, document_title, index_code, version
         FROM doc_documents
         ORDER BY coalesce(document_title, source_name), source_name
-        LIMIT %s
-        """,
-        (limit,),
-    ).fetchall()
+        """
+    parameters: tuple[Any, ...] = ()
+    if limit is not None and limit > 0:
+        query += " LIMIT %s"
+        parameters = (limit,)
+    rows = conn.execute(query, parameters).fetchall()
     return list(rows), total
 
 

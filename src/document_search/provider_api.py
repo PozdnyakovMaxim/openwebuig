@@ -95,13 +95,21 @@ class ProviderChat:
         if not self.model:
             raise ValueError("Provider chat model is not set. Use PROVIDER_CHAT_MODEL or --chat-model.")
 
-    def complete(self, messages: list[dict[str, str]], *, temperature: float = 0.0) -> str:
+    def complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+    ) -> str:
         payload = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
             "stream": False,
         }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         data = self._post_json("/chat/completions", payload)
         choices = data.get("choices") or []
         if choices:

@@ -78,7 +78,7 @@ def _call_rag(url: str, api_key: str, query: str) -> str:
         timings = metrics.get("timings_ms") or {}
         route = metrics.get("route") or response.headers.get("X-RAG-Route") or "unknown"
     fields = [f" route={route}"]
-    for name in ("embedding", "search", "database", "generation"):
+    for name in ("routing", "embedding", "search", "database", "generation"):
         if name in timings:
             fields.append(f" {name}_ms={float(timings[name]):.2f}")
     return "".join(fields)
