@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import logging
-import os
 from typing import Any
 
 
@@ -37,13 +36,10 @@ def route_query(
     query: str,
     *,
     chat_history: list[dict[str, str]] | None = None,
-    max_tokens: int | None = None,
 ) -> RouteDecision:
-    token_limit = max_tokens or int(os.getenv("RAG_ROUTER_MAX_TOKENS") or "256")
     raw_response = chat.complete(
         build_router_messages(query, chat_history=chat_history),
         temperature=0.0,
-        max_tokens=token_limit,
     )
     try:
         return parse_route_decision(raw_response)

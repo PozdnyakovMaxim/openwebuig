@@ -43,7 +43,7 @@ class QueryRouterTest(unittest.TestCase):
             decision,
             RouteDecision(route="general", answer="У меня всё хорошо. Чем помочь?"),
         )
-        self.assertEqual(chat.calls[0]["max_tokens"], 256)
+        self.assertIsNone(chat.calls[0]["max_tokens"])
 
     def test_model_decision_routes_document_question_to_rag(self) -> None:
         chat = FakeChat('{"route":"rag","answer":""}')
