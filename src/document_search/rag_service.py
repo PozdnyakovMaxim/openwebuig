@@ -1,15 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 import re
+import time
 from typing import Any
 
 from .answering import build_messages, extractive_answer
 from .chat_history import build_retrieval_query
-from .pgvector_store import connect, database_url
+from .pgvector_store import connect, database_url, list_documents
 from .provider_api import make_chat, make_embedder
 from .retriever import hybrid_search
+from .service_queries import (
+    capabilities_answer,
+    classify_service_query,
+    documents_answer,
+    identity_answer,
+)
 from .settings import load_env_file
 
 
@@ -20,6 +27,8 @@ class RagAnswer:
     sources: list[str]
     rows: list[dict[str, Any]]
     mode: str
+    route: str = "rag"
+    timings_ms: dict[str, float] = field(default_factory=dict)
 
 
 def has_chat_config(chat_provider: str | None = None, chat_model: str | None = None) -> bool:
@@ -45,8 +54,39 @@ def answer_question(
     extractive: bool = False,
     temperature: float = 0.0,
 ) -> RagAnswer:
+    started = time.perf_counter()
     load_env_file()
+    service_route = classify_service_query(query)
+    if service_route == "identity":
+        return _service_answer(query, identity_answer(), service_route, started)
+    if service_route == "capabilities":
+        return _service_answer(query, capabilities_answer(), service_route, started)
+    if service_route == "documents":
+        database_started = time.perf_counter()
+        with connect(database_url(database_url_override)) as conn:
+            documents, total = list_documents(
+                conn,
+                limit=int(os.getenv("RAG_DOCUMENT_LIST_LIMIT") or "200"),
+            )
+        timings = {
+            "database": _elapsed_ms(database_started),
+            "total": _elapsed_ms(started),
+        }
+        return RagAnswer(
+            query=query,
+            answer=documents_answer(documents, total=total),
+            sources=[],
+            rows=[],
+            mode="service",
+            route="documents",
+            timings_ms=timings,
+        )
+
+    retrieval_query_started = time.perf_counter()
     search_query = build_retrieval_query(query, chat_history)
+    retrieval_query_ms = _elapsed_ms(retrieval_query_started)
+
+    embedding_started = time.perf_counter()
     embedder = make_embedder(
         provider=embed_provider,
         provider_api_base_url=provider_api_base_url,
@@ -54,18 +94,30 @@ def answer_question(
         model=embed_model,
     )
     embedding = embedder.embed_text(search_query)
+    embedding_ms = _elapsed_ms(embedding_started)
 
+    search_started = time.perf_counter()
     with connect(database_url(database_url_override)) as conn:
         rows = hybrid_search(conn, query=search_query, embedding=embedding, limit=limit)
+    search_ms = _elapsed_ms(search_started)
 
     sources = [str(row["citation_label"]) for row in rows]
     if extractive or not has_chat_config(chat_provider, chat_model):
+        answer_started = time.perf_counter()
+        answer = extractive_answer(query, rows)
         return RagAnswer(
             query=query,
-            answer=extractive_answer(query, rows),
+            answer=answer,
             sources=sources,
             rows=rows,
             mode="extractive",
+            timings_ms={
+                "query": retrieval_query_ms,
+                "embedding": embedding_ms,
+                "search": search_ms,
+                "generation": _elapsed_ms(answer_started),
+                "total": _elapsed_ms(started),
+            },
         )
 
     chat = make_chat(
@@ -74,12 +126,21 @@ def answer_question(
         provider_api_key=provider_api_key,
         model=chat_model,
     )
+    generation_started = time.perf_counter()
+    answer = chat.complete(build_messages(query, rows, chat_history=chat_history), temperature=temperature)
     return RagAnswer(
         query=query,
-        answer=chat.complete(build_messages(query, rows, chat_history=chat_history), temperature=temperature),
+        answer=answer,
         sources=sources,
         rows=rows,
         mode="generated",
+        timings_ms={
+            "query": retrieval_query_ms,
+            "embedding": embedding_ms,
+            "search": search_ms,
+            "generation": _elapsed_ms(generation_started),
+            "total": _elapsed_ms(started),
+        },
     )
 
 
@@ -94,6 +155,22 @@ def append_sources(answer: RagAnswer) -> str:
     for index in source_numbers:
         lines.append(f"[{index}] {answer.sources[index - 1]}")
     return "\n".join(lines)
+
+
+def _service_answer(query: str, answer: str, route: str, started: float) -> RagAnswer:
+    return RagAnswer(
+        query=query,
+        answer=answer,
+        sources=[],
+        rows=[],
+        mode="service",
+        route=route,
+        timings_ms={"total": _elapsed_ms(started)},
+    )
+
+
+def _elapsed_ms(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000, 2)
 
 
 def _cited_source_numbers(text: str, *, max_source_number: int) -> list[int]:

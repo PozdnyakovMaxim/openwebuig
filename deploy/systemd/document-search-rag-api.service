@@ -1,0 +1,15 @@
+[Unit]
+Description=Document Search RAG API
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pozdniakov
+WorkingDirectory=/home/pozdniakov/openwebuig
+ExecStart=/home/pozdniakov/.local/bin/uv run python scripts/serve_openai_compatible.py --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

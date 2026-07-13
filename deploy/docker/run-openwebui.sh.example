@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="${PROJECT_DIR:-/home/pozdniakov/openwebuig}"
+ENV_FILE="${ENV_FILE:-$PROJECT_DIR/deploy/env/openwebui.env}"
+
+sudo docker rm -f document-search-webui 2>/dev/null || true
+
+sudo docker run -d \
+  --name document-search-webui \
+  --restart unless-stopped \
+  -p 3000:8080 \
+  -v open-webui:/app/backend/data \
+  -v "$PROJECT_DIR/deploy/certs:/app/backend/data/certs:ro" \
+  --add-host host.docker.internal:host-gateway \
+  --env-file "$ENV_FILE" \
+  ghcr.io/open-webui/open-webui:main

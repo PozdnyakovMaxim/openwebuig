@@ -1,0 +1,32 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+deploy/env/*.env
+!deploy/env/*.env.example
+.DS_Store
+
+# Generated pipeline outputs. Rebuild them on each machine.
+artifacts/*
+!artifacts/.gitkeep
+
+# Source documents should not be committed.
+docs/*
+!docs/.gitkeep
+
+# Local packaging/build leftovers.
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.vscode/
+.idea/
+*.log
+
+# Local deployment certificates and private keys.
+deploy/certs/*
+!deploy/certs/.gitkeep

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -42,6 +43,7 @@ class ModelsResponse(BaseModel):
 
 
 app = FastAPI(title="Document Search OpenAI-Compatible API")
+logger = logging.getLogger("uvicorn.error")
 
 
 @app.get("/health")
@@ -65,6 +67,7 @@ def list_models(authorization: str | None = Header(default=None)) -> ModelsRespo
 @app.post("/v1/chat/completions", response_model=None)
 def chat_completions(
     request: ChatCompletionRequest,
+    response: Response,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any] | StreamingResponse:
     _check_auth(authorization)
@@ -84,6 +87,13 @@ def chat_completions(
         temperature=float(request.temperature or 0.0),
     )
     content = append_sources(rag_answer)
+    headers = _timing_headers(rag_answer.route, rag_answer.timings_ms)
+    logger.info(
+        "rag_request route=%s mode=%s timings_ms=%s",
+        rag_answer.route,
+        rag_answer.mode,
+        json.dumps(rag_answer.timings_ms, ensure_ascii=False, sort_keys=True),
+    )
 
     response_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
@@ -92,7 +102,11 @@ def chat_completions(
         return StreamingResponse(
             _stream_completion(response_id=response_id, created=created, model=model, content=content),
             media_type="text/event-stream",
+            headers=headers,
         )
+
+    for name, value in headers.items():
+        response.headers[name] = value
 
     return {
         "id": response_id,
@@ -107,6 +121,11 @@ def chat_completions(
             }
         ],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "rag_metrics": {
+            "route": rag_answer.route,
+            "mode": rag_answer.mode,
+            "timings_ms": rag_answer.timings_ms,
+        },
     }
 
 
@@ -158,3 +177,15 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _timing_headers(route: str, timings_ms: dict[str, float]) -> dict[str, str]:
+    metrics = []
+    for name in ("query", "embedding", "search", "database", "generation", "total"):
+        if name in timings_ms:
+            metrics.append(f"{name};dur={timings_ms[name]:.2f}")
+    return {
+        "Server-Timing": ", ".join(metrics),
+        "X-RAG-Route": route,
+        "X-RAG-Total-Ms": f"{timings_ms.get('total', 0.0):.2f}",
+    }

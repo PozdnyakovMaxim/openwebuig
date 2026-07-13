@@ -44,7 +44,7 @@ def main() -> int:
     print(append_sources(answer))
     if answer.mode == "extractive" and not args.extractive:
         print("\nПодсказка: для LLM-ответа задай --chat-model или *_CHAT_MODEL в .env.")
-    return 0 if answer.rows else 1
+    return 0 if answer.rows or answer.mode == "service" else 1
 
 
 if __name__ == "__main__":

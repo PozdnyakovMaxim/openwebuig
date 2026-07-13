@@ -226,6 +226,20 @@ def count_rows(conn: Any) -> dict[str, int]:
     return {"documents": int(documents), "chunks": int(chunks)}
 
 
+def list_documents(conn: Any, *, limit: int = 200) -> tuple[list[dict[str, Any]], int]:
+    total = int(conn.execute("SELECT count(*) AS value FROM doc_documents").fetchone()["value"])
+    rows = conn.execute(
+        """
+        SELECT source_name, document_title, index_code, version
+        FROM doc_documents
+        ORDER BY coalesce(document_title, source_name), source_name
+        LIMIT %s
+        """,
+        (limit,),
+    ).fetchall()
+    return list(rows), total
+
+
 def sample_vector_search(conn: Any, *, embedding: list[float], limit: int = 5) -> list[dict[str, Any]]:
     return list(
         conn.execute(
