@@ -87,6 +87,41 @@ class QueryRouterTest(unittest.TestCase):
             ),
         )
 
+    def test_full_document_can_request_clarification(self) -> None:
+        decision = parse_route_decision(
+            '{"route":"full_document","answer":"Какой из двух документов вывести?","document_query":""}'
+        )
+
+        self.assertEqual(
+            decision,
+            RouteDecision(
+                route="full_document",
+                answer="Какой из двух документов вывести?",
+            ),
+        )
+
+    def test_router_history_keeps_end_with_source_names(self) -> None:
+        messages = build_router_messages(
+            "А полный текст этого документа выведи",
+            chat_history=[
+                {
+                    "role": "assistant",
+                    "content": (
+                        "Начало длинного ответа. "
+                        + "Очень длинный текст. " * 400
+                        + "\nИсточники:\n[1] 12-ПЛ1 Политика информационной безопасности.docx"
+                    ),
+                }
+            ],
+        )
+
+        payload = json.loads(messages[1]["content"])
+
+        self.assertIn(
+            "12-ПЛ1 Политика информационной безопасности.docx",
+            payload["history"][0]["content"],
+        )
+
     def test_invalid_model_response_safely_falls_back_to_rag(self) -> None:
         chat = FakeChat("неструктурированный ответ")
 

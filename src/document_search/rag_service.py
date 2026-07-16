@@ -97,8 +97,16 @@ def answer_question(
             timings_ms=timings,
         )
     if service_route == "full_document":
+        if not decision.document_query:
+            return _service_answer(
+                query,
+                decision.answer or "Уточните, полный текст какого документа нужно вывести.",
+                service_route,
+                started,
+                routing_ms=routing_ms,
+            )
         database_started = time.perf_counter()
-        document_query = decision.document_query or query
+        document_query = decision.document_query
         with connect(database_url(database_url_override)) as conn:
             candidates = find_documents(conn, document_query)
             document = candidates[0] if candidates and float(candidates[0]["match_score"]) >= 0.2 else None

@@ -119,6 +119,27 @@ class ServiceQueriesTest(unittest.TestCase):
         self.assertNotIn("\n\nПервый раздел.", answer.answer)
         make_embedder.assert_not_called()
 
+    def test_ambiguous_full_document_request_asks_for_clarification(self) -> None:
+        with (
+            patch("document_search.rag_service.make_chat", return_value=MagicMock()),
+            patch(
+                "document_search.rag_service.route_query",
+                return_value=RouteDecision(
+                    route="full_document",
+                    answer="Уточните, какой документ нужно вывести.",
+                ),
+            ),
+            patch("document_search.rag_service.connect") as connect,
+        ):
+            answer = answer_question(
+                "Выведи полный текст этого документа",
+                chat_model="test-model",
+            )
+
+        self.assertEqual(answer.route, "full_document")
+        self.assertIn("Уточните", answer.answer)
+        connect.assert_not_called()
+
     def test_full_document_answer_joins_all_chunks(self) -> None:
         answer = full_document_answer(
             {"document_title": "Инструкция"},
