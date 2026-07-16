@@ -74,6 +74,19 @@ class QueryRouterTest(unittest.TestCase):
 
         self.assertEqual(decision, RouteDecision(route="documents"))
 
+    def test_parser_extracts_document_query_for_full_document(self) -> None:
+        decision = parse_route_decision(
+            '{"route":"full_document","answer":"","document_query":"Политика резервного копирования"}'
+        )
+
+        self.assertEqual(
+            decision,
+            RouteDecision(
+                route="full_document",
+                document_query="Политика резервного копирования",
+            ),
+        )
+
     def test_invalid_model_response_safely_falls_back_to_rag(self) -> None:
         chat = FakeChat("неструктурированный ответ")
 

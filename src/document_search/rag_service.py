@@ -8,13 +8,15 @@ from typing import Any
 
 from .answering import build_messages, extractive_answer
 from .chat_history import build_retrieval_query
-from .pgvector_store import connect, database_url, list_documents
+from .pgvector_store import connect, database_url, find_documents, list_documents, load_document_chunks
 from .provider_api import make_chat, make_embedder
 from .query_router import RouteDecision, route_query
 from .retriever import hybrid_search
 from .service_queries import (
     capabilities_answer,
+    document_not_found_answer,
     documents_answer,
+    full_document_answer,
     identity_answer,
 )
 from .settings import load_env_file
@@ -91,6 +93,31 @@ def answer_question(
             rows=[],
             mode="service",
             route="documents",
+            timings_ms=timings,
+        )
+    if service_route == "full_document":
+        database_started = time.perf_counter()
+        document_query = decision.document_query or query
+        with connect(database_url(database_url_override)) as conn:
+            candidates = find_documents(conn, document_query)
+            document = candidates[0] if candidates and float(candidates[0]["match_score"]) >= 0.2 else None
+            chunks = load_document_chunks(conn, str(document["doc_id"])) if document else []
+        timings = {
+            "routing": routing_ms,
+            "database": _elapsed_ms(database_started),
+            "total": _elapsed_ms(started),
+        }
+        if document is None:
+            content = document_not_found_answer(document_query, candidates)
+        else:
+            content = full_document_answer(document, chunks)
+        return RagAnswer(
+            query=query,
+            answer=content,
+            sources=[],
+            rows=[],
+            mode="service",
+            route="full_document",
             timings_ms=timings,
         )
     if service_route == "general":

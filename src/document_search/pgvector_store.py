@@ -241,6 +241,55 @@ def list_documents(conn: Any, *, limit: int | None = None) -> tuple[list[dict[st
     return list(rows), total
 
 
+def find_documents(conn: Any, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
+    normalized = query.strip()
+    if not normalized:
+        return []
+    return list(
+        conn.execute(
+            """
+            SELECT
+                doc_id,
+                source_name,
+                document_title,
+                index_code,
+                version,
+                greatest(
+                    similarity(lower(coalesce(document_title, '')), lower(%s)),
+                    similarity(lower(source_name), lower(%s)),
+                    similarity(lower(coalesce(index_code, '')), lower(%s))
+                ) AS match_score
+            FROM doc_documents
+            ORDER BY
+                CASE
+                    WHEN lower(coalesce(document_title, '')) = lower(%s)
+                        OR lower(source_name) = lower(%s)
+                        OR lower(coalesce(index_code, '')) = lower(%s)
+                    THEN 1 ELSE 0
+                END DESC,
+                match_score DESC,
+                coalesce(document_title, source_name)
+            LIMIT %s
+            """,
+            (normalized, normalized, normalized, normalized, normalized, normalized, limit),
+        ).fetchall()
+    )
+
+
+def load_document_chunks(conn: Any, doc_id: str) -> list[dict[str, Any]]:
+    return list(
+        conn.execute(
+            """
+            SELECT chunk_id, raw_text, citation_label
+            FROM doc_chunks
+            WHERE doc_id = %s AND chunk_type <> 'metadata'
+            ORDER BY chunk_id
+            """,
+            (doc_id,),
+        ).fetchall()
+    )
+
+
 def sample_vector_search(conn: Any, *, embedding: list[float], limit: int = 5) -> list[dict[str, Any]]:
     return list(
         conn.execute(

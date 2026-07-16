@@ -32,6 +32,33 @@ def documents_answer(documents: list[dict[str, object]], *, total: int) -> str:
     return "\n".join(lines)
 
 
+def full_document_answer(
+    document: dict[str, object],
+    chunks: list[dict[str, object]],
+) -> str:
+    title = str(document.get("document_title") or document.get("source_name") or "Без названия")
+    if not chunks:
+        return f"Документ «{title}» найден, но его текст отсутствует в индексе."
+
+    text = "\n\n".join(str(chunk.get("raw_text") or "").strip() for chunk in chunks)
+    return f"Полный текст документа «{title}»:\n\n{text.strip()}"
+
+
+def document_not_found_answer(
+    query: str,
+    candidates: list[dict[str, object]],
+) -> str:
+    if not candidates:
+        return f"Не удалось найти документ по запросу «{query}»."
+
+    lines = [f"Не удалось однозначно определить документ по запросу «{query}». Возможные варианты:"]
+    for index, document in enumerate(candidates, start=1):
+        title = str(document.get("document_title") or document.get("source_name") or "Без названия")
+        lines.append(f"{index}. {title}")
+    lines.append("Уточните название документа.")
+    return "\n".join(lines)
+
+
 def _document_word(value: int) -> str:
     if value % 10 == 1 and value % 100 != 11:
         return "документ"
