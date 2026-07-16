@@ -153,14 +153,18 @@ def _last_user_text(messages: list[ChatMessage]) -> str:
 
 
 def _stream_completion(*, response_id: str, created: int, model: str, content: str):
-    first = {
-        "id": response_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": {"role": "assistant", "content": content}, "finish_reason": None}],
-    }
-    yield f"data: {json.dumps(first, ensure_ascii=False)}\n\n"
+    for index, offset in enumerate(range(0, len(content), 2000)):
+        delta: dict[str, str] = {"content": content[offset : offset + 2000]}
+        if index == 0:
+            delta["role"] = "assistant"
+        chunk = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
     final = {
         "id": response_id,
         "object": "chat.completion.chunk",

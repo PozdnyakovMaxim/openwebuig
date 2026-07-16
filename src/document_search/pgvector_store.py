@@ -254,6 +254,7 @@ def find_documents(conn: Any, query: str, *, limit: int = 5) -> list[dict[str, A
                 document_title,
                 index_code,
                 version,
+                metadata,
                 greatest(
                     similarity(lower(coalesce(document_title, '')), lower(%s)),
                     similarity(lower(source_name), lower(%s)),

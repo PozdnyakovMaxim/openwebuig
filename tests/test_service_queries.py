@@ -101,6 +101,10 @@ class ServiceQueriesTest(unittest.TestCase):
                 "document_search.rag_service.load_document_chunks",
                 return_value=chunks,
             ),
+            patch(
+                "document_search.rag_service.load_source_document_text",
+                return_value="Исходный первый раздел.\n\nИсходный второй раздел.",
+            ),
             patch("document_search.rag_service.make_embedder") as make_embedder,
         ):
             answer = answer_question(
@@ -110,7 +114,9 @@ class ServiceQueriesTest(unittest.TestCase):
 
         self.assertEqual(answer.route, "full_document")
         self.assertEqual(answer.mode, "service")
-        self.assertLess(answer.answer.index("Первый раздел."), answer.answer.index("Второй раздел."))
+        self.assertIn("Исходный первый раздел.", answer.answer)
+        self.assertIn("Исходный второй раздел.", answer.answer)
+        self.assertNotIn("\n\nПервый раздел.", answer.answer)
         make_embedder.assert_not_called()
 
     def test_full_document_answer_joins_all_chunks(self) -> None:
@@ -120,6 +126,15 @@ class ServiceQueriesTest(unittest.TestCase):
         )
 
         self.assertEqual(answer, "Полный текст документа «Инструкция»:\n\nЧасть 1\n\nЧасть 2")
+
+    def test_full_document_answer_prefers_source_text(self) -> None:
+        answer = full_document_answer(
+            {"document_title": "Инструкция"},
+            [{"raw_text": "Текст из чанка"}],
+            source_text="Полный исходный текст",
+        )
+
+        self.assertEqual(answer, "Полный текст документа «Инструкция»:\n\nПолный исходный текст")
 
 
 if __name__ == "__main__":

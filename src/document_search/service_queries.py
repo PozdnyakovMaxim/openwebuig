@@ -35,12 +35,14 @@ def documents_answer(documents: list[dict[str, object]], *, total: int) -> str:
 def full_document_answer(
     document: dict[str, object],
     chunks: list[dict[str, object]],
+    *,
+    source_text: str | None = None,
 ) -> str:
     title = str(document.get("document_title") or document.get("source_name") or "Без названия")
-    if not chunks:
+    text = source_text or "\n\n".join(str(chunk.get("raw_text") or "").strip() for chunk in chunks)
+    if not text.strip():
         return f"Документ «{title}» найден, но его текст отсутствует в индексе."
 
-    text = "\n\n".join(str(chunk.get("raw_text") or "").strip() for chunk in chunks)
     return f"Полный текст документа «{title}»:\n\n{text.strip()}"
 
 

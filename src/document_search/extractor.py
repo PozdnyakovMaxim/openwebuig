@@ -580,6 +580,11 @@ def extract_docx(source_path: str | Path) -> StructuredDocument:
     return StructuredDocument(metadata=metadata, blocks=blocks)
 
 
+def extract_docx_text(source_path: str | Path) -> str:
+    doc = Document(Path(source_path))
+    return "\n\n".join(block.text for block in _iter_block_items(doc) if block.text).strip()
+
+
 def extract_many(paths: Iterable[str | Path]) -> list[StructuredDocument]:
     return [extract_docx(path) for path in paths]
 
