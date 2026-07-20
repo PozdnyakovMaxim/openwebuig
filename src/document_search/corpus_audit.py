@@ -7,16 +7,10 @@ import re
 from typing import Any
 
 from .chunker import DEFAULT_MAX_CHARS, chunk_document
-from .extractor import extract_docx, extract_docx_text
+from .extractor import extract_docx
 from .pgvector_store import connect, database_url, redact_url
 
 
-NON_INDEXED_BLOCK_KINDS = {
-    "front_matter",
-    "heading",
-    "appendix_heading",
-    "appendix_title",
-}
 WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+", re.UNICODE)
 
 
@@ -536,7 +530,7 @@ def _audit_document(
     fresh_data: dict[str, Any] | None = None
     try:
         fresh_data = extract_docx(source_file).to_dict()
-        source_text = extract_docx_text(source_file)
+        source_text = _structured_document_text(fresh_data)
     except Exception as exc:
         _issue(
             issues,
@@ -631,16 +625,8 @@ def _audit_document(
             doc_id=doc_id,
             source_name=source_name,
         )
-    indexable_blocks = [
-        block
-        for block in blocks
-        if block.get("text") and block.get("kind") not in NON_INDEXED_BLOCK_KINDS
-    ]
-    excluded_blocks = [
-        block
-        for block in blocks
-        if block.get("text") and block.get("kind") in NON_INDEXED_BLOCK_KINDS
-    ]
+    indexable_blocks = [block for block in blocks if block.get("text")]
+    excluded_blocks: list[dict[str, Any]] = []
     report["intentionally_non_indexed_blocks"] = len(excluded_blocks)
     report["intentionally_non_indexed_chars"] = sum(
         len(str(block.get("text") or "")) for block in excluded_blocks

@@ -104,6 +104,19 @@ class StructuredDocument:
         }
 
 
+def _ensure_unique_block_ids(blocks: list[ContentBlock]) -> None:
+    seen: set[str] = set()
+    for index, block in enumerate(blocks, start=1):
+        base = block.block_id or f"block-{index}"
+        candidate = base
+        suffix = 2
+        while candidate in seen:
+            candidate = f"{base}--{suffix}"
+            suffix += 1
+        block.block_id = candidate
+        seen.add(candidate)
+
+
 def _normalize_text(text: str) -> str:
     cleaned = text.replace("\xa0", " ").replace("\r", "\n")
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
@@ -429,10 +442,7 @@ def extract_docx(source_path: str | Path) -> StructuredDocument:
         if in_toc:
             if _looks_like_toc_entry(text) or _style_is_toc(raw_block):
                 continue
-            if _parse_numeric_prefix(text) or APPENDIX_RE.match(text):
-                in_toc = False
-            else:
-                continue
+            in_toc = False
 
         appendix_match = APPENDIX_RE.match(text)
         if appendix_match:
@@ -577,6 +587,7 @@ def extract_docx(source_path: str | Path) -> StructuredDocument:
                 )
             )
 
+    _ensure_unique_block_ids(blocks)
     return StructuredDocument(metadata=metadata, blocks=blocks)
 
 

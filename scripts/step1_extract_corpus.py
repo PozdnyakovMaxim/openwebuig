@@ -18,7 +18,7 @@ from document_search.extractor import extract_docx, write_extraction
 def resolve_inputs(patterns: list[str]) -> list[Path]:
     resolved: list[Path] = []
     for pattern in patterns:
-        matches = sorted(Path(match) for match in glob.glob(pattern))
+        matches = sorted(Path(match) for match in glob.glob(pattern, recursive=True))
         if matches:
             resolved.extend(matches)
             continue

@@ -342,6 +342,13 @@ def chunk_document(
         if kind in {"front_matter", "heading", "appendix_heading", "appendix_title"}:
             _flush_unit(chunks, metadata, current, max_chars)
             current = None
+            if block.get("text"):
+                _flush_unit(
+                    chunks,
+                    metadata,
+                    ChunkUnit(unit_type=str(kind), blocks=[block]),
+                    max_chars,
+                )
             continue
 
         if kind == "numbered_paragraph":

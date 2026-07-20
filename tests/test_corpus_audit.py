@@ -23,7 +23,10 @@ class CorpusAuditTest(unittest.TestCase):
         self.assertEqual(report["status"], "ok", report["issues"])
         self.assertEqual(report["summary"]["source_documents"], 1)
         self.assertEqual(report["summary"]["errors"], 0)
-        self.assertEqual(report["documents"][0]["covered_blocks"], 2)
+        self.assertEqual(
+            report["documents"][0]["covered_blocks"],
+            report["documents"][0]["indexable_blocks"],
+        )
         self.assertEqual(report["documents"][0]["chunk_text_coverage"], 1.0)
         self.assertEqual(report["documents"][0]["chunk_snapshot_changed"], 0)
         self.assertEqual(report["summary"]["unsearchable_non_indexed_blocks"], 0)
@@ -130,20 +133,37 @@ class CorpusAuditTest(unittest.TestCase):
         self.assertEqual(report["status"], "error")
         self.assertIn("chunk_snapshot_changed", codes)
 
-    def test_non_indexed_heading_must_remain_searchable(self) -> None:
+    def test_heading_missing_from_chunks_is_reported(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             paths = self._build_corpus(Path(temporary_directory))
+            extraction_path = next(
+                path for path in paths[1].glob("*.json") if path.name != "manifest.json"
+            )
+            extraction = json.loads(extraction_path.read_text(encoding="utf-8"))
+            heading_id = next(
+                block["block_id"]
+                for block in extraction["blocks"]
+                if block.get("kind") == "heading" and block.get("text") == "Назначение"
+            )
             chunks_path = next(paths[2].glob("*.chunks.json"))
             data = json.loads(chunks_path.read_text(encoding="utf-8"))
-            for chunk in data["chunks"]:
-                chunk["searchable_text"] = chunk["searchable_text"].replace("Назначение", "")
+            data["chunks"] = [
+                chunk
+                for chunk in data["chunks"]
+                if heading_id not in (chunk.get("block_ids") or [])
+            ]
+            data["chunk_count"] = len(data["chunks"])
             chunks_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            manifest_path = paths[2] / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest[0]["chunks"] = len(data["chunks"])
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
 
             report = audit_corpus(*paths, skip_database=True)
 
         codes = {issue["code"] for issue in report["issues"]}
         self.assertEqual(report["status"], "error")
-        self.assertIn("non_indexed_blocks_not_searchable", codes)
+        self.assertIn("chunk_blocks_missing", codes)
 
     def test_custom_chunk_size_is_replayed_from_manifest(self) -> None:
         with TemporaryDirectory() as temporary_directory:
