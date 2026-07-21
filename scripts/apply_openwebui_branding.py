@@ -533,7 +533,7 @@ if models_router_file.exists():
         models_router_file.write_text(updated, encoding="utf-8")
         print("patched_model_profile_image=true")
 
-db_file = Path("/app/backend/data/webui.db")
+db_file = Path(config.get("db_path") or "/app/backend/data/webui.db")
 if db_file.exists():
     import sqlite3
 
@@ -542,81 +542,164 @@ if db_file.exists():
         def table_columns(table_name: str) -> set[str]:
             return {row[1] for row in con.execute(f"pragma table_info({table_name})").fetchall()}
 
-        row = con.execute("select id, data from config order by id limit 1").fetchone()
-        if row:
-            config_id, raw = row
-            try:
-                data = json.loads(raw)
-            except Exception:
-                data = {}
-            ui = data.setdefault("ui", {})
-            data["name"] = brand_name
-            data["title"] = brand_name
-            data["default_models"] = default_model_id
-            data["default_pinned_models"] = default_model_id
-            data["default_model"] = default_model_id
-            data["default_prompt_suggestions"] = []
-            ui["prompt_suggestions"] = []
-            ui["enable_signup"] = False
-            ui["locale"] = "ru-RU"
-            ui["language"] = "ru-RU"
-            ui["default_models"] = default_model_id
-            ui["default_pinned_models"] = default_model_id
-            ui["default_model"] = default_model_id
-            ui["show_changelog"] = False
-            ollama = data.setdefault("ollama", {})
-            ollama["enable"] = False
-            evaluation = data.setdefault("evaluation", {})
-            arena = evaluation.setdefault("arena", {})
-            arena["enable"] = False
-            arena["models"] = []
-            con.execute(
-                "update config set data = ?, updated_at = datetime('now') where id = ?",
-                (json.dumps(data, ensure_ascii=False), config_id),
-            )
-        else:
-            data = {
-                "version": 0,
-                "name": brand_name,
-                "title": brand_name,
-                "default_models": default_model_id,
-                "default_pinned_models": default_model_id,
-                "default_model": default_model_id,
-                "ui": {
-                    "enable_signup": False,
-                    "prompt_suggestions": [],
-                    "default_models": default_model_id,
-                    "default_pinned_models": default_model_id,
-                    "default_model": default_model_id,
-                    "show_changelog": False,
-                },
-                "ollama": {"enable": False},
-                "evaluation": {"arena": {"enable": False, "models": []}},
-            }
-            con.execute(
-                "insert into config (id, data, version, created_at, updated_at) values (1, ?, 0, datetime('now'), datetime('now'))",
-                (json.dumps(data, ensure_ascii=False),),
-            )
-        for user_id, raw_settings in con.execute("select id, settings from user").fetchall():
-            try:
-                settings = json.loads(raw_settings or "{}")
-            except Exception:
-                settings = {}
-            ui = settings.setdefault("ui", {})
-            ui["locale"] = "ru-RU"
-            ui["language"] = "ru-RU"
-            ui["default_models"] = default_model_id
-            ui["default_pinned_models"] = default_model_id
-            ui["default_model"] = default_model_id
-            con.execute(
-                "update user set settings = ?, updated_at = strftime('%s', 'now') where id = ?",
-                (json.dumps(settings, ensure_ascii=False), user_id),
-            )
         tables = {row[0] for row in con.execute("select name from sqlite_master where type='table'").fetchall()}
+        if "config" in tables:
+            config_columns = table_columns("config")
+            if {"key", "value"}.issubset(config_columns):
+                now = int(time.time())
+
+                def upsert_config_key(key: str, value: object) -> None:
+                    encoded = json.dumps(value, ensure_ascii=False)
+                    existing = con.execute("select key from config where key = ?", (key,)).fetchone()
+                    if existing:
+                        query = "update config set value = ?"
+                        params = [encoded]
+                        if "updated_at" in config_columns:
+                            query += ", updated_at = ?"
+                            params.append(now)
+                        query += " where key = ?"
+                        params.append(key)
+                        con.execute(query, params)
+                        return
+                    values = {"key": key, "value": encoded, "updated_at": now}
+                    insert_columns = [name for name in values if name in config_columns]
+                    placeholders = ", ".join("?" for _ in insert_columns)
+                    con.execute(
+                        f"insert into config ({', '.join(insert_columns)}) values ({placeholders})",
+                        [values[name] for name in insert_columns],
+                    )
+
+                for key, value in {
+                    "ui.enable_signup": False,
+                    "ui.default_locale": "ru-RU",
+                    "ui.default_models": default_model_id,
+                    "ui.default_pinned_models": default_model_id,
+                    "ui.model_order_list": [default_model_id],
+                    "ui.prompt_suggestions": [],
+                    "ollama.enable": False,
+                    "evaluation.arena.enable": False,
+                    "evaluation.arena.models": [],
+                }.items():
+                    upsert_config_key(key, value)
+            elif {"id", "data"}.issubset(config_columns):
+                row = con.execute("select id, data from config order by id limit 1").fetchone()
+                if row:
+                    config_id, raw = row
+                    try:
+                        data = json.loads(raw)
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        raise SystemExit(
+                            "Open WebUI legacy config JSON is invalid; refusing to overwrite it"
+                        ) from exc
+                    if not isinstance(data, dict):
+                        raise SystemExit(
+                            "Open WebUI legacy config JSON is not an object; refusing to overwrite it"
+                        )
+                    ui = data.get("ui")
+                    if not isinstance(ui, dict):
+                        ui = {}
+                        data["ui"] = ui
+                    data["name"] = brand_name
+                    data["title"] = brand_name
+                    data["default_models"] = default_model_id
+                    data["default_pinned_models"] = default_model_id
+                    data["default_model"] = default_model_id
+                    data["default_prompt_suggestions"] = []
+                    ui["prompt_suggestions"] = []
+                    ui["enable_signup"] = False
+                    ui["locale"] = "ru-RU"
+                    ui["language"] = "ru-RU"
+                    ui["default_models"] = default_model_id
+                    ui["default_pinned_models"] = default_model_id
+                    ui["default_model"] = default_model_id
+                    ui["show_changelog"] = False
+                    ollama = data.get("ollama")
+                    if not isinstance(ollama, dict):
+                        ollama = {}
+                        data["ollama"] = ollama
+                    ollama["enable"] = False
+                    evaluation = data.get("evaluation")
+                    if not isinstance(evaluation, dict):
+                        evaluation = {}
+                        data["evaluation"] = evaluation
+                    arena = evaluation.get("arena")
+                    if not isinstance(arena, dict):
+                        arena = {}
+                        evaluation["arena"] = arena
+                    arena["enable"] = False
+                    arena["models"] = []
+                    query = "update config set data = ?"
+                    params = [json.dumps(data, ensure_ascii=False)]
+                    if "updated_at" in config_columns:
+                        query += ", updated_at = datetime('now')"
+                    query += " where id = ?"
+                    params.append(config_id)
+                    con.execute(query, params)
+                else:
+                    data = {
+                        "version": 0,
+                        "name": brand_name,
+                        "title": brand_name,
+                        "default_models": default_model_id,
+                        "default_pinned_models": default_model_id,
+                        "default_model": default_model_id,
+                        "ui": {
+                            "enable_signup": False,
+                            "prompt_suggestions": [],
+                            "default_models": default_model_id,
+                            "default_pinned_models": default_model_id,
+                            "default_model": default_model_id,
+                            "show_changelog": False,
+                        },
+                        "ollama": {"enable": False},
+                        "evaluation": {"arena": {"enable": False, "models": []}},
+                    }
+                    values = {
+                        "id": 1,
+                        "data": json.dumps(data, ensure_ascii=False),
+                        "version": 0,
+                    }
+                    parameter_columns = [name for name in values if name in config_columns]
+                    insert_columns = list(parameter_columns)
+                    insert_expressions = ["?" for _ in insert_columns]
+                    for timestamp_column in ("created_at", "updated_at"):
+                        if timestamp_column in config_columns:
+                            insert_columns.append(timestamp_column)
+                            insert_expressions.append("CURRENT_TIMESTAMP")
+                    con.execute(
+                        f"insert into config ({', '.join(insert_columns)}) values ({', '.join(insert_expressions)})",
+                        [values[name] for name in parameter_columns],
+                    )
+
+        if "user" in tables:
+            user_columns = table_columns("user")
+            if {"id", "settings"}.issubset(user_columns):
+                for user_id, raw_settings in con.execute("select id, settings from user").fetchall():
+                    try:
+                        settings = json.loads(raw_settings or "{}")
+                    except Exception:
+                        settings = {}
+                    ui = settings.setdefault("ui", {})
+                    ui["locale"] = "ru-RU"
+                    ui["language"] = "ru-RU"
+                    ui["default_models"] = default_model_id
+                    ui["default_pinned_models"] = default_model_id
+                    ui["default_model"] = default_model_id
+                    query = "update user set settings = ?"
+                    params = [json.dumps(settings, ensure_ascii=False)]
+                    if "updated_at" in user_columns:
+                        query += ", updated_at = ?"
+                        params.append(int(time.time()))
+                    query += " where id = ?"
+                    params.append(user_id)
+                    con.execute(query, params)
         if "model" in tables:
             columns = table_columns("model")
             now = int(time.time())
-            user_row = con.execute("select id from user order by created_at limit 1").fetchone()
+            user_row = None
+            if "user" in tables:
+                user_order = "created_at" if "created_at" in table_columns("user") else "id"
+                user_row = con.execute(f"select id from user order by {user_order} limit 1").fetchone()
             user_id = user_row[0] if user_row else "system"
             meta = {
                 "profile_image_url": "/static/brand-icon.svg",

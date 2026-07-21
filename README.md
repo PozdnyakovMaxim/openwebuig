@@ -329,6 +329,18 @@ uv run python scripts/serve_openai_compatible.py --host 0.0.0.0 --port 8000
 sudo docker exec document-search-webui python -c "import os,urllib.request; req=urllib.request.Request('http://host.docker.internal:8000/v1/models',headers={'Authorization':'Bearer '+os.environ['OPENAI_API_KEY']}); print(urllib.request.urlopen(req,timeout=5).read().decode())"
 ```
 
+Если проверка возвращает `401`, либо модель исчезла после смены
+`OPENAI_COMPAT_API_KEY`, синхронизировать сохранённый connection Open WebUI с `.env`:
+
+```bash
+sudo bash scripts/repair_openwebui_access.sh
+```
+
+Скрипт сначала проверяет новый ключ напрямую через `/v1/models`, делает backup
+`webui.db`, затем обновляет persistent connection, модель по умолчанию и доступ. Он
+поддерживает как старую схему Open WebUI `config(id,data)`, так и текущую
+`config(key,value)`; LDAP, пользователи, чаты и остальные настройки не удаляются.
+
 Если контейнер видит модель, зайти в Open WebUI:
 
 ```text
@@ -372,7 +384,7 @@ sudo bash scripts/recreate_openwebui_for_ldap_users.sh
 sudo python3 scripts/fix_openwebui_model_access.py --container document-search-webui --model-id document-search-rag --custom-model-id glavstroy-llm --model-name ГлавстройLLM --activate-pending
 ```
 
-Скрипт перед изменениями автоматически создает backup `webui.db` внутри volume Open WebUI. Он удаляет старый дубль `glavstroy-llm`, оставляет одну модель `document-search-rag` с именем `ГлавстройLLM`, назначает ее моделью по умолчанию и выдает публичный `read`-доступ через `access_grant`.
+Скрипт перед изменениями автоматически создает backup `webui.db` внутри volume Open WebUI. Он синхронизирует URL и ключ connection с `.env`, удаляет старый дубль `glavstroy-llm`, оставляет одну модель `document-search-rag` с именем `ГлавстройLLM`, назначает ее моделью по умолчанию и выдает публичный `read`-доступ через `access_grant`.
 
 ## 8. Если чаты пропали слева
 
