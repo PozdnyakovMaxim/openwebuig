@@ -1,0 +1,55 @@
+{
+  "api_base_url": "http://127.0.0.1:8000/v1",
+  "model": "document-search-rag",
+  "api_key_env": "OPENAI_COMPAT_API_KEY",
+  "timeout_seconds": 120,
+  "cases": [
+    {
+      "id": "identity",
+      "query": "Кто ты?",
+      "expected_route": "identity",
+      "expected_answer_substrings": [
+        "ГлавстройLLM",
+        "внутренний ассистент"
+      ],
+      "forbidden_substrings": [
+        "В найденных документах ответа нет."
+      ],
+      "max_latency_ms": 10000
+    },
+    {
+      "id": "documents-by-topic",
+      "query": "Какие документы есть про резервное копирование?",
+      "expected_route": "documents",
+      "expected_title_substrings": [
+        "Политика резервного копирования"
+      ],
+      "max_latency_ms": 30000
+    },
+    {
+      "id": "follow-up-with-source",
+      "history": [
+        {
+          "role": "user",
+          "content": "Какие требования установлены к резервному копированию?"
+        },
+        {
+          "role": "assistant",
+          "content": "Резервное копирование выполняется по утвержденной политике. [1]\n\nИсточники:\n[1] Политика резервного копирования"
+        }
+      ],
+      "query": "Кто за это отвечает?",
+      "expected_route": "rag",
+      "expected_source_substrings": [
+        "Политика резервного копирования"
+      ],
+      "expected_answer_substrings": [
+        "ответствен"
+      ],
+      "forbidden_substrings": [
+        "В найденных документах ответа нет."
+      ],
+      "max_latency_ms": 60000
+    }
+  ]
+}

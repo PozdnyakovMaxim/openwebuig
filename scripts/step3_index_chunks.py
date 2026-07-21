@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -12,20 +13,96 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from document_search.pgvector_store import (
+    CORPUS_PROMOTION_ADVISORY_LOCK_KEY,
+    acquire_corpus_promotion_lock,
     connect,
     count_rows,
     database_url,
     delete_chunks_for_doc,
     init_schema,
     redact_url,
+    resolve_embedding_index_id,
     upsert_chunk,
     upsert_document,
 )
 from document_search.provider_api import make_embedder
+from corpus_candidate_integrity import (
+    validate_integrity_metadata,
+    verify_candidate_audit,
+    verify_candidate_integrity,
+)
 
 
-def resolve_chunk_files(input_dir: Path) -> list[Path]:
+def _candidate_chunk_hashes(
+    input_dir: Path,
+    marker: dict[str, object],
+) -> dict[Path, str]:
+    validate_integrity_metadata(marker)
+    candidate_dir = input_dir.parent.resolve()
+    resolved_input_dir = input_dir.resolve()
+    integrity = marker["integrity"]
+    assert isinstance(integrity, dict)
+    entries = integrity["files"]
+    assert isinstance(entries, list)
+    hashes: dict[Path, str] = {}
+    for entry in entries:
+        assert isinstance(entry, dict)
+        if entry.get("kind") != "chunk_json":
+            continue
+        relative_path = Path(str(entry["path"]))
+        path = (candidate_dir / relative_path).resolve()
+        if not path.is_relative_to(resolved_input_dir):
+            raise ValueError(
+                f"Candidate chunk path is outside the selected input directory: {relative_path}"
+            )
+        if path in hashes:
+            raise ValueError(f"Candidate contains a duplicate chunk path: {relative_path}")
+        hashes[path] = str(entry["sha256"]).casefold()
+    if not hashes:
+        raise ValueError("Candidate integrity metadata contains no chunk JSON files")
+    return hashes
+
+
+def resolve_chunk_files(
+    input_dir: Path,
+    *,
+    candidate_marker: dict[str, object] | None = None,
+) -> list[Path]:
+    input_dir = input_dir.resolve()
     manifest_path = input_dir / "manifest.json"
+    if candidate_marker is not None:
+        expected = _candidate_chunk_hashes(input_dir, candidate_marker)
+        if not manifest_path.is_file():
+            raise ValueError(f"Candidate chunk manifest is missing: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, list):
+            raise ValueError("Candidate chunk manifest must be a JSON list")
+        paths: list[Path] = []
+        candidate_dir = input_dir.parent
+        for item in manifest:
+            if not isinstance(item, dict):
+                raise ValueError("Candidate chunk manifest contains a non-object entry")
+            raw_value = str(item.get("chunked_path") or "")
+            raw_path = Path(raw_value)
+            if not raw_value or raw_path.is_absolute() or ".." in raw_path.parts:
+                raise ValueError(
+                    "Candidate chunked_path must be relative to and contained in the candidate: "
+                    f"{raw_value!r}"
+                )
+            path = (candidate_dir / raw_path).resolve()
+            if not path.is_relative_to(input_dir):
+                raise ValueError(f"Candidate manifest path is outside chunks/: {raw_path}")
+            paths.append(path)
+        if len(paths) != len(set(paths)):
+            raise ValueError("Candidate chunk manifest contains duplicate paths")
+        if set(paths) != set(expected):
+            missing = sorted(str(path) for path in set(expected) - set(paths))
+            unexpected = sorted(str(path) for path in set(paths) - set(expected))
+            raise ValueError(
+                "Candidate chunk manifest does not match READY integrity entries: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        return sorted(paths)
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         paths: list[Path] = []
@@ -41,7 +118,7 @@ def resolve_chunk_files(input_dir: Path) -> list[Path]:
     return sorted(path for path in input_dir.glob("*.chunks.json"))
 
 
-def load_candidate_marker(input_dir: Path) -> dict[str, int]:
+def load_candidate_marker(input_dir: Path) -> dict[str, object]:
     ready_path = input_dir.parent / "READY"
     if not ready_path.is_file():
         raise ValueError(
@@ -52,14 +129,15 @@ def load_candidate_marker(input_dir: Path) -> dict[str, int]:
         data = json.loads(ready_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"Invalid candidate marker: {ready_path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Candidate marker must be a JSON object: {ready_path}")
 
-    result: dict[str, int] = {}
     for field in ("documents", "substantive_blocks", "chunks", "characters"):
         value = data.get(field)
         if not isinstance(value, int) or value <= 0:
             raise ValueError(f"Candidate marker has invalid {field}: {value!r}")
-        result[field] = value
-    return result
+    validate_integrity_metadata(data)
+    return data
 
 
 def batched(items: list[dict], size: int) -> list[list[dict]]:
@@ -71,6 +149,7 @@ def load_and_validate_corpus(
     *,
     limit: int | None = None,
     expected_documents: int | None = None,
+    expected_file_hashes: dict[Path, str] | None = None,
 ) -> list[dict]:
     if expected_documents is not None and len(files) != expected_documents:
         raise ValueError(
@@ -81,7 +160,19 @@ def load_and_validate_corpus(
     document_ids: set[str] = set()
     chunk_ids: set[str] = set()
     for path in files:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        resolved_path = path.resolve()
+        payload = path.read_bytes()
+        if expected_file_hashes is not None:
+            expected_hash = expected_file_hashes.get(resolved_path)
+            if expected_hash is None:
+                raise ValueError(f"Loaded chunk file is not tracked by READY: {resolved_path}")
+            actual_hash = hashlib.sha256(payload).hexdigest()
+            if actual_hash != expected_hash:
+                raise ValueError(
+                    f"Loaded chunk file hash mismatch for {resolved_path}: "
+                    f"expected {expected_hash}, received {actual_hash}"
+                )
+        data = json.loads(payload)
         metadata = data.get("metadata") or {}
         doc_id = str(metadata.get("doc_id") or "").strip()
         source_name = str(metadata.get("source_name") or "").strip()
@@ -116,7 +207,11 @@ def load_and_validate_corpus(
             if chunk.get("char_count") != len(str(chunk.get("raw_text") or "")):
                 raise ValueError(f"{chunk_id}: char_count does not match raw_text")
 
-        records.append({"path": path, "metadata": metadata, "chunks": chunks})
+        records.append({"path": resolved_path, "metadata": metadata, "chunks": chunks})
+    if expected_file_hashes is not None and {
+        record["path"] for record in records
+    } != set(expected_file_hashes):
+        raise ValueError("Loaded chunk files do not exactly match READY integrity entries")
     return records
 
 
@@ -215,26 +310,34 @@ def main() -> int:
         raise SystemExit("--replace-corpus requires --expected-documents")
 
     input_dir = Path(args.input_dir).resolve()
-    files = resolve_chunk_files(input_dir)
-    if not files:
-        raise SystemExit(f"No chunk files found in {input_dir}")
-    candidate_summary: dict[str, int] | None = None
+    candidate_summary: dict[str, object] | None = None
+    expected_file_hashes: dict[Path, str] | None = None
     if args.replace_corpus:
         try:
             candidate_summary = load_candidate_marker(input_dir)
-        except ValueError as exc:
+            verify_candidate_integrity(input_dir.parent, candidate_summary)
+            verify_candidate_audit(input_dir.parent, candidate_summary)
+            expected_file_hashes = _candidate_chunk_hashes(input_dir, candidate_summary)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise SystemExit(str(exc)) from exc
         if candidate_summary["documents"] != args.expected_documents:
             raise SystemExit(
                 "Candidate document count does not match --expected-documents: "
                 f"{candidate_summary['documents']} != {args.expected_documents}"
             )
+    try:
+        files = resolve_chunk_files(input_dir, candidate_marker=candidate_summary)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Chunk file resolution failed: {exc}") from exc
+    if not files:
+        raise SystemExit(f"No chunk files found in {input_dir}")
 
     try:
         records = load_and_validate_corpus(
             files,
             limit=args.limit,
             expected_documents=args.expected_documents,
+            expected_file_hashes=expected_file_hashes,
         )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise SystemExit(f"Corpus validation failed: {exc}") from exc
@@ -251,6 +354,10 @@ def main() -> int:
             f"Embedding dimension mismatch: model returned {actual_dim}, "
             f"but --embedding-dim is {args.embedding_dim}."
         )
+    try:
+        embedding_model_id = resolve_embedding_index_id(embedder)
+    except ValueError as exc:
+        raise SystemExit(f"Embedding profile is invalid: {exc}") from exc
 
     if args.atomic:
         try:
@@ -263,7 +370,11 @@ def main() -> int:
     url = database_url(args.database_url)
     with connect(url) as conn:
         if args.init_schema:
-            init_schema(conn, embedding_dim=args.embedding_dim)
+            schema_warnings = init_schema(conn, embedding_dim=args.embedding_dim)
+            for warning in schema_warnings:
+                print(f"WARNING: {warning}")
+            if any("IVFFLAT index was not created either" in warning for warning in schema_warnings):
+                raise SystemExit("Schema initialization failed to create a vector ANN index")
 
         if args.atomic:
             expected_chunks = sum(len(record["chunks"]) for record in records)
@@ -280,11 +391,20 @@ def main() -> int:
             try:
                 with conn.transaction():
                     if args.replace_corpus:
+                        acquire_corpus_promotion_lock(conn)
+                        try:
+                            verify_candidate_integrity(input_dir.parent, candidate_summary)
+                            verify_candidate_audit(input_dir.parent, candidate_summary)
+                        except (OSError, ValueError) as exc:
+                            raise ValueError(
+                                "Candidate integrity verification failed under promotion lock: "
+                                f"{exc}"
+                            ) from exc
                         conn.execute("DELETE FROM doc_documents")
                     total_chunks = index_records(
                         conn,
                         records,
-                        embedding_model=embedder.model,
+                        embedding_model=embedding_model_id,
                         replace_documents=not args.no_replace and not args.replace_corpus,
                     )
                     if total_chunks != expected_chunks:
@@ -293,6 +413,8 @@ def main() -> int:
                             f"received {total_chunks}"
                         )
                     if args.replace_corpus:
+                        verify_candidate_integrity(input_dir.parent, candidate_summary)
+                        verify_candidate_audit(input_dir.parent, candidate_summary)
                         counts = count_rows(conn)
                         if counts != {
                             "documents": len(records),
@@ -322,7 +444,12 @@ def main() -> int:
                 texts = [chunk["searchable_text"] for chunk in batch]
                 embeddings = embedder.embed_texts(texts)
                 for chunk, embedding in zip(batch, embeddings, strict=True):
-                    upsert_chunk(conn, chunk, embedding=embedding, embedding_model=embedder.model)
+                    upsert_chunk(
+                        conn,
+                        chunk,
+                        embedding=embedding,
+                        embedding_model=embedding_model_id,
+                    )
                 total_chunks += len(batch)
                 print(f"Indexed {total_chunks} chunks...", flush=True)
 

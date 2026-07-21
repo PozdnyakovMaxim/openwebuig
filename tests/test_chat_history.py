@@ -3,7 +3,11 @@ from __future__ import annotations
 import unittest
 
 from document_search.answering import build_messages
-from document_search.chat_history import build_retrieval_query, normalize_history
+from document_search.chat_history import (
+    build_retrieval_query,
+    normalize_history,
+    resolve_ordinal_reference,
+)
 
 
 class ChatHistoryTest(unittest.TestCase):
@@ -69,7 +73,62 @@ class ChatHistoryTest(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(query, "Какие правила резервного копирования?\nА кто отвечает за контроль?")
+        self.assertEqual(
+            query,
+            "Какие правила резервного копирования?\n"
+            "Резервное копирование описано в политике.\n"
+            "А кто отвечает за контроль?",
+        )
+
+    def test_build_retrieval_query_does_not_mix_unrelated_old_topic(self) -> None:
+        query = build_retrieval_query(
+            "Как оформляется отпуск?",
+            [
+                {"role": "user", "content": "Какие правила резервного копирования?"},
+                {"role": "assistant", "content": "Они описаны в политике ИБ."},
+            ],
+        )
+
+        self.assertEqual(query, "Как оформляется отпуск?")
+
+    def test_resolves_ordinal_against_latest_assistant_list(self) -> None:
+        reference = resolve_ordinal_reference(
+            "Раскрой второй пункт подробнее",
+            [
+                {
+                    "role": "assistant",
+                    "content": "1. Создать заявку\n2. Согласовать доступ\n3. Закрыть заявку",
+                }
+            ],
+        )
+
+        self.assertEqual(
+            reference,
+            {
+                "position": 2,
+                "kind": "пункт",
+                "list_label": "2",
+                "text": "Согласовать доступ",
+            },
+        )
+
+    def test_out_of_range_ordinal_does_not_fall_back_to_older_list(self) -> None:
+        reference = resolve_ordinal_reference(
+            "Покажи четвёртый документ",
+            [
+                {
+                    "role": "assistant",
+                    "content": "1. Старый один\n2. Старый два\n3. Старый три\n4. Старый четыре",
+                },
+                {"role": "user", "content": "Какие документы есть по новой теме?"},
+                {
+                    "role": "assistant",
+                    "content": "1. Новый один\n2. Новый два\n3. Новый три",
+                },
+            ],
+        )
+
+        self.assertIsNone(reference)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ if str(SRC) not in sys.path:
 
 from document_search.corpus_audit import audit_corpus
 from document_search.settings import load_env_file
+from corpus_candidate_integrity import certify_candidate_audit, sha256_file
 
 
 def _default_path(relative: str) -> Path:
@@ -38,7 +39,28 @@ def main() -> int:
     parser.add_argument("--skip-database", action="store_true")
     parser.add_argument("--report", default=str(ROOT / "artifacts/rag_audit.json"))
     parser.add_argument("--strict", action="store_true", help="Return nonzero for warnings too.")
+    parser.add_argument(
+        "--certify-candidate",
+        action="store_true",
+        help="Write an AUDITED gate for a clean strict pre-database candidate audit.",
+    )
     args = parser.parse_args()
+    if args.certify_candidate and (not args.strict or not args.skip_database):
+        parser.error("--certify-candidate requires --strict and --skip-database")
+
+    candidate_dir: Path | None = None
+    ready_path: Path | None = None
+    ready_sha256_before: str | None = None
+    if args.certify_candidate:
+        extracted_parent = Path(args.extracted_dir).expanduser().resolve().parent
+        chunks_parent = Path(args.chunks_dir).expanduser().resolve().parent
+        if extracted_parent != chunks_parent:
+            parser.error("Candidate extracted/ and chunks/ directories must share one parent")
+        candidate_dir = extracted_parent
+        ready_path = candidate_dir / "READY"
+        if not ready_path.is_file():
+            parser.error(f"Candidate READY is missing: {ready_path}")
+        ready_sha256_before = sha256_file(ready_path)
 
     load_env_file(ROOT / ".env")
     load_env_file(ROOT.parent / "rag_template" / ".env")
@@ -49,6 +71,14 @@ def main() -> int:
         database=args.database_url,
         skip_database=args.skip_database,
     )
+    if candidate_dir is not None and ready_path is not None and ready_sha256_before is not None:
+        ready_sha256_after = sha256_file(ready_path)
+        if ready_sha256_after != ready_sha256_before:
+            raise SystemExit("Candidate READY changed while the strict audit was running")
+        report["candidate"] = {
+            "candidate_dir": str(candidate_dir),
+            "ready_sha256": ready_sha256_before,
+        }
     output_path = Path(args.report).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
@@ -67,6 +97,14 @@ def main() -> int:
         f"source={summary['source_characters']}, "
         f"extracted={summary['extracted_characters']}, "
         f"chunks={summary['chunk_characters']}"
+    )
+    print(
+        "Independent OOXML inventory: "
+        f"segments={summary['source_segments']}, "
+        f"ignored={summary['source_ignored_segments']}, "
+        f"tokens={summary['source_tokens']}, "
+        f"missing={summary['source_missing_tokens']}, "
+        f"coverage={summary['source_token_coverage']:.1%}"
     )
     print(
         "Blocks: "
@@ -98,6 +136,11 @@ def main() -> int:
         return 1
     if args.strict and summary["warnings"]:
         return 1
+    if args.certify_candidate:
+        assert candidate_dir is not None
+        certification = certify_candidate_audit(candidate_dir, output_path)
+        print(f"Audit certification: {candidate_dir / 'AUDITED'}")
+        print(f"Certified report SHA-256: {certification['report_sha256']}")
     return 0
 
 

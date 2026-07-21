@@ -10,7 +10,15 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from document_search.pgvector_store import connect, count_rows, database_url, sample_vector_search
+from document_search.pgvector_store import (
+    acquire_corpus_read_lock,
+    connect,
+    count_rows,
+    database_url,
+    resolve_embedding_index_id,
+    sample_vector_search,
+    validate_embedding_profile,
+)
 from document_search.provider_api import make_embedder
 
 
@@ -35,7 +43,13 @@ def main() -> int:
 
     url = database_url(args.database_url)
     with connect(url) as conn:
+        acquire_corpus_read_lock(conn)
         counts = count_rows(conn)
+        validate_embedding_profile(
+            conn,
+            expected_model=resolve_embedding_index_id(embedder),
+            expected_dimension=len(embedding),
+        )
         rows = sample_vector_search(conn, embedding=embedding, limit=args.limit)
 
     print(f"Documents: {counts['documents']}")

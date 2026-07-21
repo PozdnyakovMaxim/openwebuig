@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import statistics
 import sys
@@ -25,13 +26,20 @@ def main() -> int:
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--rag-url", default="http://127.0.0.1:8000/v1/chat/completions")
-    parser.add_argument("--api-key", default="anything")
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="RAG API key. Defaults to OPENAI_COMPAT_API_KEY from the environment/.env.",
+    )
     args = parser.parse_args()
     load_env_file()
+    api_key = args.api_key or os.getenv("OPENAI_COMPAT_API_KEY") or ""
+    if args.target == "rag" and not api_key:
+        parser.error("--api-key or OPENAI_COMPAT_API_KEY is required for the RAG target")
 
     for _ in range(args.warmup):
         if args.target == "rag":
-            _call_rag(args.rag_url, args.api_key, args.query)
+            _call_rag(args.rag_url, api_key, args.query)
         else:
             _call_provider(args.query)
 
@@ -39,7 +47,7 @@ def main() -> int:
     for run_number in range(1, args.runs + 1):
         started = time.perf_counter()
         if args.target == "rag":
-            details = _call_rag(args.rag_url, args.api_key, args.query)
+            details = _call_rag(args.rag_url, api_key, args.query)
         else:
             details = _call_provider(args.query)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)

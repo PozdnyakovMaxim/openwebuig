@@ -67,12 +67,51 @@ class QueryRouterTest(unittest.TestCase):
         self.assertEqual(len(payload["history"]), 2)
         self.assertIn("резервного копирования", payload["history"][0]["content"])
 
+    def test_router_receives_resolved_ordinal_list_reference(self) -> None:
+        messages = build_router_messages(
+            "Покажи второй документ полностью",
+            chat_history=[
+                {
+                    "role": "assistant",
+                    "content": "1. Политика ИБ (security.docx)\n2. Регламент доступа (access.docx)",
+                }
+            ],
+        )
+
+        payload = json.loads(messages[1]["content"])
+
+        self.assertEqual(payload["resolved_reference"]["position"], 2)
+        self.assertIn("Регламент доступа", payload["resolved_reference"]["text"])
+
     def test_parser_accepts_json_inside_code_fence(self) -> None:
         decision = parse_route_decision(
             '```json\n{"route":"documents","answer":"не используется"}\n```'
         )
 
         self.assertEqual(decision, RouteDecision(route="documents"))
+
+    def test_parser_keeps_topic_query_for_filtered_document_catalog(self) -> None:
+        decision = parse_route_decision(
+            '{"route":"documents","answer":"","retrieval_query":"резервное копирование"}'
+        )
+
+        self.assertEqual(
+            decision,
+            RouteDecision(route="documents", retrieval_query="резервное копирование"),
+        )
+
+    def test_parser_keeps_standalone_query_for_rag(self) -> None:
+        decision = parse_route_decision(
+            '{"route":"rag","answer":"","retrieval_query":"кто контролирует резервное копирование"}'
+        )
+
+        self.assertEqual(
+            decision,
+            RouteDecision(
+                route="rag",
+                retrieval_query="кто контролирует резервное копирование",
+            ),
+        )
 
     def test_parser_extracts_document_query_for_full_document(self) -> None:
         decision = parse_route_decision(
@@ -100,6 +139,32 @@ class QueryRouterTest(unittest.TestCase):
             ),
         )
 
+    def test_parser_extracts_exact_document_section(self) -> None:
+        decision = parse_route_decision(
+            '{"route":"document_section","answer":"","document_query":"Политика ИБ",'
+            '"section_query":"пункт 2.3.1"}'
+        )
+
+        self.assertEqual(
+            decision,
+            RouteDecision(
+                route="document_section",
+                document_query="Политика ИБ",
+                section_query="пункт 2.3.1",
+            ),
+        )
+
+    def test_document_section_without_document_can_be_resolved_globally(self) -> None:
+        decision = parse_route_decision(
+            '{"route":"document_section","answer":"","document_query":"",'
+            '"section_query":"4.2"}'
+        )
+
+        self.assertEqual(
+            decision,
+            RouteDecision(route="document_section", section_query="4.2"),
+        )
+
     def test_router_history_keeps_end_with_source_names(self) -> None:
         messages = build_router_messages(
             "А полный текст этого документа выведи",
@@ -121,6 +186,19 @@ class QueryRouterTest(unittest.TestCase):
             "12-ПЛ1 Политика информационной безопасности.docx",
             payload["history"][0]["content"],
         )
+
+    def test_router_keeps_more_than_eight_recent_messages(self) -> None:
+        history = [
+            {"role": "user" if index % 2 == 0 else "assistant", "content": f"Сообщение {index}"}
+            for index in range(18)
+        ]
+
+        payload = json.loads(
+            build_router_messages("Продолжай", chat_history=history)[1]["content"]
+        )
+
+        self.assertEqual(len(payload["history"]), 18)
+        self.assertEqual(payload["history"][0]["content"], "Сообщение 0")
 
     def test_invalid_model_response_safely_falls_back_to_rag(self) -> None:
         chat = FakeChat("неструктурированный ответ")

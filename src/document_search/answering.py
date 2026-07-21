@@ -29,15 +29,28 @@ def format_sources(rows: list[dict[str, Any]], *, max_chars_per_source: int = 14
     return "\n\n".join(parts)
 
 
-def format_chat_history(history: list[dict[str, str]], *, max_chars_per_message: int = 800) -> str:
+def format_chat_history(
+    history: list[dict[str, str]],
+    *,
+    max_chars_per_message: int = 4000,
+    max_total_chars: int = 24000,
+) -> str:
     role_names = {"user": "Пользователь", "assistant": "Ассистент"}
-    lines: list[str] = []
-    for item in history:
+    lines_reversed: list[str] = []
+    used_chars = 0
+    for item in reversed(history):
         content = " ".join(str(item["content"]).split())
         if len(content) > max_chars_per_message:
-            content = content[: max_chars_per_message - 1].rstrip() + "..."
-        lines.append(f"{role_names.get(item['role'], item['role'])}: {content}")
-    return "\n".join(lines)
+            marker = " ... [середина сокращена] ... "
+            head = max_chars_per_message // 3
+            tail = max_chars_per_message - head - len(marker)
+            content = content[:head].rstrip() + marker + content[-tail:].lstrip()
+        line = f"{role_names.get(item['role'], item['role'])}: {content}"
+        if used_chars + len(line) > max_total_chars:
+            break
+        lines_reversed.append(line)
+        used_chars += len(line)
+    return "\n".join(reversed(lines_reversed))
 
 
 def build_messages(

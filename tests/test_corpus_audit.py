@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from docx import Document
 
@@ -30,6 +31,76 @@ class CorpusAuditTest(unittest.TestCase):
         self.assertEqual(report["documents"][0]["chunk_text_coverage"], 1.0)
         self.assertEqual(report["documents"][0]["chunk_snapshot_changed"], 0)
         self.assertEqual(report["summary"]["unsearchable_non_indexed_blocks"], 0)
+        self.assertEqual(report["summary"]["source_missing_tokens"], 0)
+        self.assertEqual(report["summary"]["source_token_coverage"], 1.0)
+
+    def test_independent_ooxml_inventory_detects_repeated_footnote_text(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            paths = self._build_corpus(Path(temporary_directory))
+            source_path = paths[0] / "Политика.docx"
+            _inject_footnote(
+                source_path,
+                "Первый обязательный пункт документа.",
+            )
+
+            report = audit_corpus(*paths, skip_database=True)
+
+        matching = [
+            issue
+            for issue in report["issues"]
+            if issue["code"] == "source_ooxml_text_missing"
+        ]
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["level"], "error")
+        self.assertGreater(report["documents"][0]["source_missing_tokens"], 0)
+        self.assertGreater(report["documents"][0]["source_critical_missing_segments"], 0)
+        self.assertIn("footnote", report["documents"][0]["source_story_counts"])
+
+    def test_unreferenced_ooxml_story_does_not_create_false_positive(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            paths = self._build_corpus(Path(temporary_directory))
+            _inject_footnote(
+                paths[0] / "Политика.docx",
+                "Несвязанная старая сноска внутри архива.",
+                add_reference=False,
+            )
+
+            report = audit_corpus(*paths, skip_database=True)
+
+        self.assertNotIn(
+            "source_ooxml_text_missing",
+            {issue["code"] for issue in report["issues"]},
+        )
+        self.assertNotIn("footnote", report["documents"][0]["source_story_counts"])
+
+    def test_literal_page_counter_is_ignored_in_headers_and_footers(self) -> None:
+        segments = [
+            corpus_audit_module.SourceTextSegment(
+                part="word/footer1.xml",
+                story="footer",
+                text="Стр. 2 из 7",
+            ),
+            corpus_audit_module.SourceTextSegment(
+                part="word/header1.xml",
+                story="header",
+                text="Политика резервного копирования",
+            ),
+            corpus_audit_module.SourceTextSegment(
+                part="word/header1.xml",
+                story="header",
+                text="Политика — стр. 2 из 7",
+                has_dynamic_page_field=True,
+            ),
+        ]
+
+        required, ignored = corpus_audit_module._partition_source_segments(segments)
+
+        self.assertEqual(
+            [item.text for item in required],
+            ["Политика резервного копирования", "Политика — стр. 2 из 7"],
+        )
+        self.assertEqual([item.text for item in ignored], ["Стр. 2 из 7"])
 
     def test_missing_block_is_reported(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -75,6 +146,27 @@ class CorpusAuditTest(unittest.TestCase):
         codes = {issue["code"] for issue in report["issues"]}
         self.assertEqual(report["status"], "error")
         self.assertIn("extraction_blocks_missing", codes)
+
+    def test_source_sha256_mismatch_is_reported(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            paths = self._build_corpus(Path(temporary_directory))
+            extraction_path = next(
+                path for path in paths[1].glob("*.json") if path.name != "manifest.json"
+            )
+            extraction = json.loads(extraction_path.read_text(encoding="utf-8"))
+            extraction["metadata"]["source_sha256"] = "0" * 64
+            extraction_path.write_text(
+                json.dumps(extraction, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            report = audit_corpus(*paths, skip_database=True)
+
+        issue = next(
+            issue for issue in report["issues"] if issue["code"] == "extraction_metadata_stale"
+        )
+        self.assertEqual(report["status"], "error")
+        self.assertIn("source_sha256", issue["details"]["fields"])
 
     def test_empty_source_directory_is_reported(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -187,15 +279,31 @@ class CorpusAuditTest(unittest.TestCase):
             document_row = {
                 "doc_id": extraction["metadata"]["doc_id"],
                 "source_name": extraction["metadata"]["source_name"],
+                "index_code": extraction["metadata"].get("index_code"),
+                "document_title": extraction["metadata"].get("display_title"),
+                "version": extraction["metadata"].get("version"),
                 "metadata": extraction["metadata"],
             }
             chunk_row = {
                 "chunk_id": chunk["chunk_id"],
                 "doc_id": chunk["doc_id"],
                 "source_name": chunk["source_name"],
+                "index_code": chunk.get("index_code"),
+                "document_title": chunk.get("document_title"),
+                "version": chunk.get("version"),
+                "chunk_type": chunk.get("chunk_type"),
+                "citation_label": chunk.get("citation_label"),
                 "raw_text": chunk["raw_text"],
                 "searchable_text": chunk["searchable_text"],
                 "block_ids": chunk.get("block_ids") or [],
+                "section_path": chunk.get("section_path") or [],
+                "section_labels": chunk.get("section_labels") or [],
+                "section_title": chunk.get("section_title"),
+                "subsection_title": chunk.get("subsection_title"),
+                "item_number": chunk.get("item_number"),
+                "heading_number": chunk.get("heading_number"),
+                "appendix_number": chunk.get("appendix_number"),
+                "appendix_title": chunk.get("appendix_title"),
                 "char_count": chunk["char_count"],
                 "embedding_model": "bge-m3",
                 "metadata": chunk,
@@ -218,6 +326,77 @@ class CorpusAuditTest(unittest.TestCase):
         self.assertTrue(result["checked"])
         self.assertEqual(result["missing_embeddings"], 1)
         self.assertIn("database_embeddings_missing", {issue["code"] for issue in issues})
+
+    def test_database_scalar_retrieval_metadata_mismatch_is_reported(self) -> None:
+        expected = {
+            "chunk_id": "chunk-1",
+            "doc_id": "doc-1",
+            "source_name": "document.docx",
+            "index_code": "TEST-1.0",
+            "document_title": "Политика",
+            "version": "1.0",
+            "chunk_type": "numbered_item",
+            "citation_label": "Политика, пункт 1.1",
+            "raw_text": "1.1 Требование",
+            "searchable_text": "Пункт: 1.1\n1.1 Требование",
+            "block_ids": ["item-1.1"],
+            "section_path": ["1"],
+            "section_labels": ["1 Общие положения"],
+            "section_title": "Общие положения",
+            "subsection_title": None,
+            "item_number": "1.1",
+            "heading_number": None,
+            "appendix_number": None,
+            "appendix_title": None,
+            "char_count": 15,
+        }
+        document_metadata = {
+            "doc_id": "doc-1",
+            "source_name": "document.docx",
+            "index_code": "TEST-1.0",
+            "display_title": "Политика",
+            "version": "1.0",
+        }
+        document_row = {
+            "doc_id": "doc-1",
+            "source_name": "document.docx",
+            "index_code": "TEST-1.0",
+            "document_title": "Политика",
+            "version": "1.0",
+            "metadata": document_metadata,
+        }
+        chunk_row = {
+            **expected,
+            "citation_label": "Испорченная цитата",
+            "section_labels": ["9 Испорченный раздел"],
+            "heading_number": "9",
+            "embedding_model": "bge-m3",
+            "metadata": expected,
+            "embedding_missing": False,
+            "embedding_dim": 1024,
+        }
+        issues: list[dict[str, object]] = []
+        with (
+            patch.object(corpus_audit_module, "database_url", return_value="postgresql://db"),
+            patch.object(
+                corpus_audit_module,
+                "connect",
+                return_value=_FakeConnection(document_row, chunk_row),
+            ),
+        ):
+            corpus_audit_module._audit_database(
+                None,
+                {"doc-1": {"source_name": "document.docx", "metadata": document_metadata}},
+                {"chunk-1": expected},
+                issues,
+            )
+
+        mismatch = next(
+            issue for issue in issues if issue["code"] == "database_chunk_content_mismatch"
+        )
+        self.assertIn("citation_label", mismatch["details"]["chunks"]["chunk-1"])
+        self.assertIn("section_labels", mismatch["details"]["chunks"]["chunk-1"])
+        self.assertIn("heading_number", mismatch["details"]["chunks"]["chunk-1"])
 
     def _build_corpus(
         self,
@@ -276,6 +455,62 @@ class CorpusAuditTest(unittest.TestCase):
             encoding="utf-8",
         )
         return docs_dir, extracted_dir, chunks_dir
+
+
+def _inject_footnote(path: Path, text: str, *, add_reference: bool = True) -> None:
+    with ZipFile(path) as source:
+        files = {item.filename: source.read(item.filename) for item in source.infolist()}
+
+    content_types = files["[Content_Types].xml"].decode("utf-8")
+    content_types = content_types.replace(
+        "</Types>",
+        (
+            '<Override PartName="/word/footnotes.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/>'
+            "</Types>"
+        ),
+    )
+    files["[Content_Types].xml"] = content_types.encode("utf-8")
+
+    relationships_path = "word/_rels/document.xml.rels"
+    relationships = files[relationships_path].decode("utf-8")
+    relationships = relationships.replace(
+        "</Relationships>",
+        (
+            '<Relationship Id="rIdAuditFootnotes" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" '
+            'Target="footnotes.xml"/>'
+            "</Relationships>"
+        ),
+    )
+    files[relationships_path] = relationships.encode("utf-8")
+
+    if add_reference:
+        document_xml = files["word/document.xml"].decode("utf-8")
+        reference = '<w:r><w:footnoteReference w:id="1"/></w:r>'
+        document_xml = document_xml.replace("</w:p>", f"{reference}</w:p>", 1)
+        files["word/document.xml"] = document_xml.encode("utf-8")
+
+    escaped = (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+    files["word/footnotes.xml"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:footnote w:id="1"><w:p><w:r><w:t>'
+        f"{escaped}"
+        "</w:t></w:r></w:p></w:footnote>"
+        "</w:footnotes>"
+    ).encode("utf-8")
+
+    temporary_path = path.with_suffix(".rewrite.docx")
+    with ZipFile(temporary_path, "w", ZIP_DEFLATED) as destination:
+        for name, payload in files.items():
+            destination.writestr(name, payload)
+    temporary_path.replace(path)
 
 
 class _FakeRows:

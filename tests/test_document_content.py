@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import hashlib
 import unittest
 
 from docx import Document
@@ -37,6 +38,30 @@ class DocumentContentTest(unittest.TestCase):
                 text,
                 "Первый абзац\n\nЯчейка 1 | Ячейка 2\n\nПоследний абзац",
             )
+
+    def test_changed_source_file_is_not_returned_as_indexed_full_text(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            source_path = Path(temporary_directory) / "Политика.docx"
+            document = Document()
+            document.add_paragraph("Исходная редакция")
+            document.save(source_path)
+            original_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+
+            changed = Document()
+            changed.add_paragraph("Новая неиндексированная редакция")
+            changed.save(source_path)
+
+            text = load_source_document_text(
+                {
+                    "source_name": source_path.name,
+                    "metadata": {
+                        "source_path": str(source_path),
+                        "source_sha256": original_hash,
+                    },
+                }
+            )
+
+        self.assertIsNone(text)
 
 
 if __name__ == "__main__":

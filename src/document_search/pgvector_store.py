@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 
 DEFAULT_DATABASE_URL = ""
+CORPUS_PROMOTION_ADVISORY_LOCK_KEY = int.from_bytes(
+    hashlib.sha256(b"openwebuig:corpus-promotion:v1").digest()[:8],
+    byteorder="big",
+    signed=True,
+)
 
 
 def database_url(value: str | None = None) -> str:
@@ -36,6 +43,36 @@ def _load_psycopg() -> tuple[Any, Any, Any]:
 def connect(url: str | None = None) -> Any:
     psycopg, dict_row, _ = _load_psycopg()
     return psycopg.connect(database_url(url), row_factory=dict_row)
+
+
+def acquire_corpus_read_lock(conn: Any) -> None:
+    """Keep one corpus generation visible for the surrounding transaction."""
+
+    conn.execute(
+        "SELECT pg_advisory_xact_lock_shared(%s::bigint)",
+        (CORPUS_PROMOTION_ADVISORY_LOCK_KEY,),
+    )
+
+
+def acquire_corpus_promotion_lock(conn: Any) -> None:
+    """Serialize a complete corpus replacement against readers and writers."""
+
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(%s::bigint)",
+        (CORPUS_PROMOTION_ADVISORY_LOCK_KEY,),
+    )
+
+
+def resolve_embedding_index_id(embedder: Any) -> str:
+    """Return the stable embedding profile ID stored alongside vectors."""
+
+    value = getattr(embedder, "index_id", None) or getattr(embedder, "model", None)
+    if callable(value):
+        value = value()
+    result = str(value or "").strip()
+    if not result:
+        raise ValueError("Embedder does not expose an index_id or model ID")
+    return result
 
 
 def vector_literal(values: list[float]) -> str:
@@ -82,9 +119,11 @@ def init_schema(conn: Any, *, embedding_dim: int, recreate: bool = False) -> lis
             searchable_text text NOT NULL,
             block_ids text[] NOT NULL,
             section_path text[] NOT NULL DEFAULT '{{}}',
+            section_labels text[] NOT NULL DEFAULT '{{}}',
             section_title text,
             subsection_title text,
             item_number text,
+            heading_number text,
             appendix_number text,
             appendix_title text,
             char_count integer NOT NULL,
@@ -99,9 +138,28 @@ def init_schema(conn: Any, *, embedding_dim: int, recreate: bool = False) -> lis
         )
         """
     )
+    # CREATE TABLE IF NOT EXISTS does not evolve an already deployed table.
+    # Keep these migrations additive so upgrading a live index is safe.
+    conn.execute(
+        "ALTER TABLE doc_chunks "
+        "ADD COLUMN IF NOT EXISTS section_labels text[] NOT NULL DEFAULT '{}'"
+    )
+    conn.execute("ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS heading_number text")
     conn.execute("CREATE INDEX IF NOT EXISTS doc_chunks_doc_id_idx ON doc_chunks(doc_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS doc_chunks_source_idx ON doc_chunks(source_name)")
     conn.execute("CREATE INDEX IF NOT EXISTS doc_chunks_index_code_idx ON doc_chunks(index_code)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS doc_chunks_item_number_idx "
+        "ON doc_chunks(item_number) WHERE item_number IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS doc_chunks_section_path_idx "
+        "ON doc_chunks USING gin(section_path)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS doc_chunks_appendix_number_idx "
+        "ON doc_chunks(appendix_number) WHERE appendix_number IS NOT NULL"
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS doc_chunks_search_tsv_idx ON doc_chunks USING gin(search_tsv)")
     conn.commit()
 
@@ -165,12 +223,13 @@ def upsert_chunk(conn: Any, chunk: dict[str, Any], *, embedding: list[float], em
         INSERT INTO doc_chunks (
             chunk_id, doc_id, source_name, index_code, document_title, version,
             chunk_type, citation_label, raw_text, searchable_text, block_ids, section_path,
-            section_title, subsection_title, item_number, appendix_number, appendix_title,
-            char_count, embedding_model, embedding, metadata, updated_at
+            section_labels, section_title, subsection_title, item_number, heading_number,
+            appendix_number, appendix_title, char_count, embedding_model, embedding, metadata,
+            updated_at
         )
         VALUES (
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s::vector, %s, now()
+            %s, %s, %s, %s, %s::vector, %s, now()
         )
         ON CONFLICT (chunk_id) DO UPDATE SET
             source_name = EXCLUDED.source_name,
@@ -183,9 +242,11 @@ def upsert_chunk(conn: Any, chunk: dict[str, Any], *, embedding: list[float], em
             searchable_text = EXCLUDED.searchable_text,
             block_ids = EXCLUDED.block_ids,
             section_path = EXCLUDED.section_path,
+            section_labels = EXCLUDED.section_labels,
             section_title = EXCLUDED.section_title,
             subsection_title = EXCLUDED.subsection_title,
             item_number = EXCLUDED.item_number,
+            heading_number = EXCLUDED.heading_number,
             appendix_number = EXCLUDED.appendix_number,
             appendix_title = EXCLUDED.appendix_title,
             char_count = EXCLUDED.char_count,
@@ -207,9 +268,11 @@ def upsert_chunk(conn: Any, chunk: dict[str, Any], *, embedding: list[float], em
             chunk["searchable_text"],
             chunk.get("block_ids") or [],
             chunk.get("section_path") or [],
+            chunk.get("section_labels") or [],
             chunk.get("section_title"),
             chunk.get("subsection_title"),
             chunk.get("item_number"),
+            chunk.get("heading_number"),
             chunk.get("appendix_number"),
             chunk.get("appendix_title"),
             int(chunk.get("char_count") or len(chunk["raw_text"])),
@@ -281,7 +344,24 @@ def load_document_chunks(conn: Any, doc_id: str) -> list[dict[str, Any]]:
     return list(
         conn.execute(
             """
-            SELECT chunk_id, raw_text, citation_label
+            SELECT
+                chunk_id,
+                doc_id,
+                source_name,
+                index_code,
+                document_title,
+                version,
+                chunk_type,
+                raw_text,
+                citation_label,
+                section_path,
+                section_labels,
+                section_title,
+                subsection_title,
+                item_number,
+                heading_number,
+                appendix_number,
+                appendix_title
             FROM doc_chunks
             WHERE doc_id = %s AND chunk_type <> 'metadata'
             ORDER BY chunk_id
@@ -289,6 +369,197 @@ def load_document_chunks(conn: Any, doc_id: str) -> list[dict[str, Any]]:
             (doc_id,),
         ).fetchall()
     )
+
+
+def load_structural_chunks(
+    conn: Any,
+    section_reference: str,
+    *,
+    doc_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Load an exact item or a complete section subtree without semantic search."""
+
+    reference = section_reference.strip()
+    if not reference:
+        return []
+
+    appendix_match = re.fullmatch(
+        r"(?:приложение|appendix)\s*(?:№|no\.?|#)?\s*(.+)",
+        reference,
+        re.IGNORECASE,
+    )
+    if appendix_match:
+        normalized_reference = appendix_match.group(1).strip()
+        return _load_structural_match(
+            conn,
+            predicate="appendix_number = %s",
+            parameters=[normalized_reference],
+            match_type="appendix",
+            doc_id=doc_id,
+        ) if normalized_reference else []
+
+    item_match = re.fullmatch(
+        r"(?:пункт|п\.)\s*(?:№|#)?\s*(.+)",
+        reference,
+        re.IGNORECASE,
+    )
+    if item_match:
+        normalized_reference = item_match.group(1).strip()
+        return _load_structural_match(
+            conn,
+            predicate="item_number = %s",
+            parameters=[normalized_reference],
+            match_type="item",
+            doc_id=doc_id,
+        ) if normalized_reference else []
+
+    section_match = re.fullmatch(
+        r"(?:раздел|section)\s*(?:№|#)?\s*(.+)",
+        reference,
+        re.IGNORECASE,
+    )
+    if section_match:
+        normalized_reference = section_match.group(1).strip()
+        return _load_structural_match(
+            conn,
+            predicate="(heading_number = %s OR section_path @> ARRAY[%s]::text[])",
+            parameters=[normalized_reference, normalized_reference],
+            match_type="section",
+            doc_id=doc_id,
+        ) if normalized_reference else []
+
+    # Legacy/bare references prefer an exact item. Only if no item exists do
+    # they fall back to a section subtree; this avoids merging unrelated anchors.
+    normalized_reference = reference
+    rows = _load_structural_match(
+        conn,
+        predicate="item_number = %s",
+        parameters=[normalized_reference],
+        match_type="item",
+        doc_id=doc_id,
+    )
+    if rows:
+        return rows
+    return _load_structural_match(
+        conn,
+        predicate="(heading_number = %s OR section_path @> ARRAY[%s]::text[])",
+        parameters=[normalized_reference, normalized_reference],
+        match_type="section",
+        doc_id=doc_id,
+    )
+
+
+def _load_structural_match(
+    conn: Any,
+    *,
+    predicate: str,
+    parameters: list[Any],
+    match_type: str,
+    doc_id: str | None,
+) -> list[dict[str, Any]]:
+    if match_type not in {"item", "section", "appendix"}:
+        raise ValueError(f"Unsupported structural match type: {match_type}")
+    query = f"""
+        SELECT
+            chunk_id,
+            doc_id,
+            source_name,
+            index_code,
+            document_title,
+            version,
+            chunk_type,
+            citation_label,
+            raw_text,
+            block_ids,
+            section_path,
+            section_labels,
+            section_title,
+            subsection_title,
+            item_number,
+            heading_number,
+            appendix_number,
+            appendix_title,
+            '{match_type}' AS structural_match
+        FROM doc_chunks
+        WHERE chunk_type <> 'metadata'
+          AND {predicate}
+    """
+    if doc_id is not None:
+        query += " AND doc_id = %s"
+        parameters.append(doc_id)
+    query += " ORDER BY doc_id, chunk_id"
+    return list(conn.execute(query, tuple(parameters)).fetchall())
+
+
+def validate_embedding_profile(
+    conn: Any,
+    *,
+    expected_model: str,
+    expected_dimension: int,
+) -> dict[str, Any]:
+    """Ensure the stored vectors match the query embedder before retrieval."""
+
+    model_id = expected_model.strip()
+    if not model_id:
+        raise ValueError("expected_model must not be empty")
+    if expected_dimension <= 0:
+        raise ValueError("expected_dimension must be positive")
+
+    rows = list(
+        conn.execute(
+            """
+            SELECT
+                embedding_model,
+                vector_dims(embedding) AS embedding_dimension,
+                count(*) AS chunk_count
+            FROM doc_chunks
+            GROUP BY embedding_model, vector_dims(embedding)
+            ORDER BY embedding_model, embedding_dimension
+            """
+        ).fetchall()
+    )
+    if not rows:
+        raise RuntimeError("Embedding index is empty; rebuild the corpus before querying it.")
+
+    stored_models = sorted(
+        {str(row.get("embedding_model") or "").strip() for row in rows}
+    )
+    stored_dimensions = sorted(
+        {
+            int(row["embedding_dimension"])
+            for row in rows
+            if row.get("embedding_dimension") is not None
+        }
+    )
+    if "" in stored_models:
+        raise RuntimeError("Embedding index contains chunks without an embedding model ID.")
+    if len(stored_models) != 1:
+        raise RuntimeError(
+            "Embedding index contains mixed model IDs: " + ", ".join(stored_models)
+        )
+    if len(stored_dimensions) != 1:
+        rendered = ", ".join(str(value) for value in stored_dimensions) or "unknown"
+        raise RuntimeError(f"Embedding index contains mixed vector dimensions: {rendered}")
+
+    stored_model = stored_models[0]
+    stored_dimension = stored_dimensions[0]
+    if stored_model != model_id:
+        raise RuntimeError(
+            "Embedding model mismatch: "
+            f"index={stored_model!r}, query={model_id!r}. Rebuild the index or use the indexed model."
+        )
+    if stored_dimension != expected_dimension:
+        raise RuntimeError(
+            "Embedding dimension mismatch: "
+            f"index={stored_dimension}, query={expected_dimension}. "
+            "Rebuild the index or use the indexed model."
+        )
+
+    return {
+        "model_id": stored_model,
+        "dimension": stored_dimension,
+        "chunks": sum(int(row.get("chunk_count") or 0) for row in rows),
+    }
 
 
 def sample_vector_search(conn: Any, *, embedding: list[float], limit: int = 5) -> list[dict[str, Any]]:
@@ -301,6 +572,10 @@ def sample_vector_search(conn: Any, *, embedding: list[float], limit: int = 5) -
                 source_name,
                 citation_label,
                 raw_text,
+                section_path,
+                section_labels,
+                item_number,
+                heading_number,
                 1 - (embedding <=> %s::vector) AS vector_score
             FROM doc_chunks
             ORDER BY embedding <=> %s::vector

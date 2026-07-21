@@ -10,7 +10,13 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from document_search.pgvector_store import connect, database_url
+from document_search.pgvector_store import (
+    acquire_corpus_read_lock,
+    connect,
+    database_url,
+    resolve_embedding_index_id,
+    validate_embedding_profile,
+)
 from document_search.provider_api import make_embedder
 from document_search.retriever import hybrid_search
 
@@ -37,6 +43,12 @@ def main() -> int:
     embedding = embedder.embed_text(args.query)
 
     with connect(database_url(args.database_url)) as conn:
+        acquire_corpus_read_lock(conn)
+        validate_embedding_profile(
+            conn,
+            expected_model=resolve_embedding_index_id(embedder),
+            expected_dimension=len(embedding),
+        )
         rows = hybrid_search(
             conn,
             query=args.query,

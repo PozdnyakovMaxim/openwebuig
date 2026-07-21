@@ -10,6 +10,10 @@ deploy/env/*.env
 artifacts/*
 !artifacts/.gitkeep
 
+# Database dumps contain source text and must stay outside version control.
+backups/
+*.dump
+
 # Source documents should not be committed.
 docs/*
 !docs/.gitkeep

@@ -8,11 +8,19 @@ import uuid
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .chat_history import content_to_text, normalize_history
-from .pgvector_store import connect, count_rows, database_url
+from .pgvector_store import (
+    acquire_corpus_read_lock,
+    connect,
+    count_rows,
+    database_url,
+    resolve_embedding_index_id,
+    validate_embedding_profile,
+)
+from .provider_api import make_embedder
 from .rag_service import answer_question, append_sources
 from .settings import load_env_file
 
@@ -46,16 +54,45 @@ app = FastAPI(title="Document Search OpenAI-Compatible API")
 logger = logging.getLogger("uvicorn.error")
 
 
-@app.get("/health")
-def health() -> dict[str, Any]:
+@app.get("/health", response_model=None)
+def health() -> dict[str, Any] | JSONResponse:
     load_env_file()
-    counts: dict[str, int] | None = None
     try:
+        embedder = make_embedder()
+        expected_model = resolve_embedding_index_id(embedder)
+        expected_dimension = int(os.getenv("RAG_EMBEDDING_DIM") or "1024")
+        actual_dimension = int(embedder.embedding_dimension())
+        if actual_dimension != expected_dimension:
+            raise RuntimeError(
+                "Configured embedding dimension does not match the query model: "
+                f"configured={expected_dimension}, actual={actual_dimension}."
+            )
         with connect(database_url()) as conn:
+            acquire_corpus_read_lock(conn)
             counts = count_rows(conn)
-    except Exception:
-        counts = None
-    return {"status": "ok", "model": _model_id(), "index": counts}
+            profile = validate_embedding_profile(
+                conn,
+                expected_model=expected_model,
+                expected_dimension=actual_dimension,
+            )
+    except Exception as exc:
+        logger.exception("readiness_check_failed")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "error",
+                "model": _model_id(),
+                "index": None,
+                "error": "database_or_embedding_index_not_ready",
+                "error_type": type(exc).__name__,
+            },
+        )
+    return {
+        "status": "ok",
+        "model": _model_id(),
+        "index": counts,
+        "embedding_profile": profile,
+    }
 
 
 @app.get("/v1/models", response_model=ModelsResponse)
@@ -76,7 +113,7 @@ def chat_completions(
         raise HTTPException(status_code=400, detail="No user message was provided.")
 
     limit = int(os.getenv("RAG_RETRIEVAL_LIMIT") or "6")
-    chat_history_limit = int(os.getenv("RAG_CHAT_HISTORY_LIMIT") or "8")
+    chat_history_limit = int(os.getenv("RAG_CHAT_HISTORY_LIMIT") or "24")
     chat_history = normalize_history(request.messages, max_messages=chat_history_limit)
     force_extractive = _env_bool("RAG_FORCE_EXTRACTIVE", False)
     rag_answer = answer_question(

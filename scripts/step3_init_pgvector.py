@@ -45,9 +45,12 @@ def main() -> int:
     with connect(url) as conn:
         warnings = init_schema(conn, embedding_dim=args.embedding_dim, recreate=args.recreate)
 
-    print(f"pgvector schema is ready: {redact_url(url)}")
     for warning in warnings:
         print(f"WARNING: {warning}")
+    if any("IVFFLAT index was not created either" in warning for warning in warnings):
+        print(f"pgvector schema has no ANN index: {redact_url(url)}")
+        return 1
+    print(f"pgvector schema is ready: {redact_url(url)}")
     return 0
 
 

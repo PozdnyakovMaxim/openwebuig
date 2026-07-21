@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 import json
 from pathlib import Path
+import posixpath
 import re
 from typing import Any
+from xml.etree import ElementTree
+from zipfile import BadZipFile, ZipFile
 
 from .chunker import DEFAULT_MAX_CHARS, chunk_document
 from .extractor import extract_docx
@@ -12,6 +16,22 @@ from .pgvector_store import connect, database_url, redact_url
 
 
 WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё]+", re.UNICODE)
+
+WORDPROCESSINGML_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+MARKUP_COMPATIBILITY_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+W = f"{{{WORDPROCESSINGML_NS}}}"
+MC = f"{{{MARKUP_COMPATIBILITY_NS}}}"
+SOURCE_TEXT_ERROR_COVERAGE = 0.98
+
+
+@dataclass(frozen=True)
+class SourceTextSegment:
+    part: str
+    story: str
+    text: str
+    style: str = ""
+    location: str = "paragraph"
+    has_dynamic_page_field: bool = False
 
 
 def audit_corpus(
@@ -192,8 +212,22 @@ def audit_corpus(
     error_count = sum(issue["level"] == "error" for issue in issues)
     warning_count = sum(issue["level"] == "warning" for issue in issues)
     status = "error" if error_count else "warning" if warning_count else "ok"
+    source_tokens = sum(int(item.get("source_tokens") or 0) for item in documents)
+    source_missing_tokens = sum(
+        int(item.get("source_missing_tokens") or 0) for item in documents
+    )
     corpus_totals = {
         "source_characters": sum(int(item.get("source_chars") or 0) for item in documents),
+        "source_segments": sum(int(item.get("source_segments") or 0) for item in documents),
+        "source_ignored_segments": sum(
+            int(item.get("source_ignored_segments") or 0) for item in documents
+        ),
+        "source_tokens": source_tokens,
+        "source_missing_tokens": source_missing_tokens,
+        "source_token_coverage": round(
+            1.0 if not source_tokens else (source_tokens - source_missing_tokens) / source_tokens,
+            4,
+        ),
         "extracted_characters": sum(int(item.get("extracted_chars") or 0) for item in documents),
         "chunk_characters": sum(int(item.get("chunk_chars") or 0) for item in documents),
         "extracted_blocks": sum(int(item.get("blocks") or 0) for item in documents),
@@ -237,6 +271,543 @@ def _source_files(directory: Path) -> list[Path]:
         if path.is_file()
         and path.suffix.casefold() == ".docx"
         and not path.name.startswith("~$")
+    )
+
+
+def _source_ooxml_inventory(source_path: Path) -> dict[str, Any]:
+    """Read visible WordprocessingML text without using python-docx or the extractor."""
+
+    segments: list[SourceTextSegment] = []
+    try:
+        with ZipFile(source_path) as archive:
+            names = set(archive.namelist())
+            if "word/document.xml" not in names:
+                raise ValueError("word/document.xml is missing")
+            document_root = _read_ooxml_part(archive, "word/document.xml")
+            segments.extend(
+                _ooxml_paragraph_segments(document_root, "word/document.xml", "body")
+            )
+            for part_name, story, note_ids in _referenced_story_parts(
+                archive,
+                names,
+                document_root,
+            ):
+                root = _read_ooxml_part(archive, part_name)
+                segments.extend(
+                    _ooxml_paragraph_segments(
+                        root,
+                        part_name,
+                        story,
+                        note_ids=note_ids,
+                    )
+                )
+    except (BadZipFile, KeyError, OSError, ValueError) as exc:
+        raise ValueError(f"cannot inventory DOCX OOXML: {exc}") from exc
+
+    required, ignored = _partition_source_segments(segments)
+    story_counts = Counter(segment.story for segment in required)
+    location_counts = Counter(segment.location for segment in required)
+    return {
+        "segments": required,
+        "ignored_segments": ignored,
+        "story_counts": dict(sorted(story_counts.items())),
+        "location_counts": dict(sorted(location_counts.items())),
+    }
+
+
+def _read_ooxml_part(archive: ZipFile, part_name: str) -> ElementTree.Element:
+    try:
+        return ElementTree.fromstring(archive.read(part_name))
+    except ElementTree.ParseError as exc:
+        raise ValueError(f"invalid XML in {part_name}: {exc}") from exc
+
+
+def _referenced_story_parts(
+    archive: ZipFile,
+    names: set[str],
+    document_root: ElementTree.Element,
+) -> list[tuple[str, str, set[str] | None]]:
+    relationships_name = "word/_rels/document.xml.rels"
+    if relationships_name not in names:
+        return []
+    relationships_root = _read_ooxml_part(archive, relationships_name)
+    relationships: dict[str, tuple[str, str]] = {}
+    for relationship in relationships_root:
+        if _xml_local_name(relationship.tag) != "Relationship":
+            continue
+        relationship_id = str(relationship.get("Id") or "")
+        relationship_type = str(relationship.get("Type") or "").rsplit("/", 1)[-1]
+        target = str(relationship.get("Target") or "")
+        if (
+            not relationship_id
+            or relationship_type not in {"header", "footer", "footnotes", "endnotes"}
+            or not target
+            or str(relationship.get("TargetMode") or "").casefold() == "external"
+        ):
+            continue
+        part_name = _resolve_ooxml_target("word/document.xml", target)
+        if part_name not in names:
+            raise ValueError(
+                f"{relationships_name} references missing OOXML part {part_name}"
+            )
+        relationships[relationship_id] = (part_name, relationship_type)
+
+    referenced_headers = _visible_relationship_ids(
+        document_root,
+        {f"{W}headerReference", f"{W}footerReference"},
+    )
+    note_ids = {
+        "footnotes": _visible_note_ids(document_root, f"{W}footnoteReference"),
+        "endnotes": _visible_note_ids(document_root, f"{W}endnoteReference"),
+    }
+    selected: dict[str, tuple[str, str, set[str] | None]] = {}
+    for relationship_id, (part_name, relationship_type) in relationships.items():
+        if relationship_type in {"header", "footer"}:
+            if relationship_id not in referenced_headers:
+                continue
+            story = relationship_type
+            selected[part_name] = (part_name, story, None)
+            continue
+        referenced_notes = note_ids[relationship_type]
+        if referenced_notes:
+            selected[part_name] = (
+                part_name,
+                relationship_type.removesuffix("s"),
+                referenced_notes,
+            )
+    return [selected[name] for name in sorted(selected)]
+
+
+def _resolve_ooxml_target(source_part: str, target: str) -> str:
+    if target.startswith("/"):
+        resolved = posixpath.normpath(target.lstrip("/"))
+    else:
+        resolved = posixpath.normpath(
+            posixpath.join(posixpath.dirname(source_part), target)
+        )
+    if resolved in {"", ".", ".."} or resolved.startswith("../"):
+        raise ValueError(f"unsafe OOXML relationship target: {target!r}")
+    return resolved
+
+
+def _visible_relationship_ids(
+    root: ElementTree.Element,
+    tags: set[str],
+) -> set[str]:
+    values: set[str] = set()
+
+    def visit(node: ElementTree.Element) -> None:
+        if node.tag in {f"{W}del", f"{W}moveFrom"}:
+            return
+        if node.tag == f"{W}r" and _run_is_hidden(node):
+            return
+        if node.tag in tags:
+            for attribute, value in node.attrib.items():
+                if _xml_local_name(attribute) == "id" and value:
+                    values.add(value)
+                    break
+        for child in _visible_xml_children(node):
+            visit(child)
+
+    visit(root)
+    return values
+
+
+def _visible_note_ids(root: ElementTree.Element, tag: str) -> set[str]:
+    values: set[str] = set()
+
+    def visit(node: ElementTree.Element) -> None:
+        if node.tag in {f"{W}del", f"{W}moveFrom"}:
+            return
+        if node.tag == f"{W}r" and _run_is_hidden(node):
+            return
+        if node.tag == tag:
+            value = node.get(f"{W}id")
+            if value:
+                values.add(value)
+        for child in _visible_xml_children(node):
+            visit(child)
+
+    visit(root)
+    return values
+
+
+def _xml_local_name(value: str) -> str:
+    return value.rsplit("}", 1)[-1]
+
+
+def _ooxml_paragraph_segments(
+    root: ElementTree.Element,
+    part_name: str,
+    story: str,
+    *,
+    note_ids: set[str] | None = None,
+) -> list[SourceTextSegment]:
+    segments: list[SourceTextSegment] = []
+
+    def visit(
+        node: ElementTree.Element,
+        *,
+        in_textbox: bool = False,
+        in_table: bool = False,
+    ) -> None:
+        if node.tag in {f"{W}footnote", f"{W}endnote"} and node.get(f"{W}type"):
+            return
+        if (
+            note_ids is not None
+            and node.tag in {f"{W}footnote", f"{W}endnote"}
+            and node.get(f"{W}id") not in note_ids
+        ):
+            return
+        if node.tag == f"{MC}AlternateContent":
+            branch = _alternate_content_branch(node)
+            if branch is not None:
+                visit(branch, in_textbox=in_textbox, in_table=in_table)
+            return
+
+        nested_textbox = in_textbox or node.tag == f"{W}txbxContent"
+        nested_table = in_table or node.tag == f"{W}tbl"
+        if node.tag == f"{W}p":
+            text = _visible_ooxml_paragraph_text(node)
+            if text:
+                segments.append(
+                    SourceTextSegment(
+                        part=part_name,
+                        story=story,
+                        text=text,
+                        style=_ooxml_paragraph_style(node),
+                        location=(
+                            "textbox"
+                            if nested_textbox
+                            else "table"
+                            if nested_table
+                            else "paragraph"
+                        ),
+                        has_dynamic_page_field=_has_dynamic_page_field(node),
+                    )
+                )
+
+        for child in _visible_xml_children(node):
+            visit(child, in_textbox=nested_textbox, in_table=nested_table)
+
+    visit(root)
+    return segments
+
+
+def _visible_ooxml_paragraph_text(paragraph: ElementTree.Element) -> str:
+    parts: list[str] = []
+
+    def collect(node: ElementTree.Element, *, root: bool = False) -> None:
+        if not root and node.tag == f"{W}p":
+            return
+        if node.tag in {f"{W}del", f"{W}moveFrom"}:
+            return
+        if node.tag == f"{W}r" and _run_is_hidden(node):
+            return
+        if node.tag == f"{W}t":
+            if node.text:
+                parts.append(node.text)
+            return
+        if node.tag == f"{W}tab":
+            parts.append(" ")
+            return
+        if node.tag in {f"{W}br", f"{W}cr"}:
+            parts.append("\n")
+            return
+        if node.tag == f"{MC}AlternateContent":
+            branch = _alternate_content_branch(node)
+            if branch is not None:
+                collect(branch)
+            return
+        for child in _visible_xml_children(node):
+            collect(child)
+
+    collect(paragraph, root=True)
+    return _normalize_source_text("".join(parts))
+
+
+def _visible_xml_children(node: ElementTree.Element) -> list[ElementTree.Element]:
+    if node.tag != f"{MC}AlternateContent":
+        return list(node)
+    branch = _alternate_content_branch(node)
+    return [branch] if branch is not None else []
+
+
+def _alternate_content_branch(node: ElementTree.Element) -> ElementTree.Element | None:
+    choice = node.find(f"{MC}Choice")
+    return choice if choice is not None else node.find(f"{MC}Fallback")
+
+
+def _run_is_hidden(run: ElementTree.Element) -> bool:
+    properties = run.find(f"{W}rPr")
+    if properties is None:
+        return False
+    return any(
+        _ooxml_boolean_is_on(properties.find(f"{W}{name}"))
+        for name in ("vanish", "webHidden")
+    )
+
+
+def _ooxml_boolean_is_on(element: ElementTree.Element | None) -> bool:
+    if element is None:
+        return False
+    value = str(element.get(f"{W}val") or "true").strip().casefold()
+    return value not in {"0", "false", "off", "no"}
+
+
+def _ooxml_paragraph_style(paragraph: ElementTree.Element) -> str:
+    properties = paragraph.find(f"{W}pPr")
+    style = properties.find(f"{W}pStyle") if properties is not None else None
+    return str(style.get(f"{W}val") or "") if style is not None else ""
+
+
+def _has_dynamic_page_field(paragraph: ElementTree.Element) -> bool:
+    instructions = " ".join(
+        str(node.text or "") for node in paragraph.iter(f"{W}instrText")
+    ).upper()
+    return bool(re.search(r"\b(?:PAGE|NUMPAGES|SECTIONPAGES)\b", instructions))
+
+
+def _partition_source_segments(
+    segments: list[SourceTextSegment],
+) -> tuple[list[SourceTextSegment], list[SourceTextSegment]]:
+    required: list[SourceTextSegment] = []
+    ignored: list[SourceTextSegment] = []
+    toc_parts: dict[str, bool] = defaultdict(bool)
+
+    for segment in segments:
+        normalized = _normalize_source_text(segment.text)
+        style = segment.style.casefold().replace(" ", "")
+        is_toc_style = style.startswith(("toc", "contents", "оглавлен", "содержан"))
+        if segment.story == "body":
+            if normalized.casefold() in {"содержание", "оглавление"}:
+                toc_parts[segment.part] = True
+                ignored.append(segment)
+                continue
+            if is_toc_style:
+                toc_parts[segment.part] = True
+                ignored.append(segment)
+                continue
+            if toc_parts[segment.part] and _looks_like_ooxml_toc_entry(normalized):
+                ignored.append(segment)
+                continue
+            toc_parts[segment.part] = False
+
+        if segment.story in {"header", "footer"}:
+            if _is_page_counter_segment(segment, normalized):
+                ignored.append(segment)
+                continue
+        required.append(segment)
+    return required, ignored
+
+
+def _looks_like_literal_page_number(text: str) -> bool:
+    """Recognize rendered page counters that contain no searchable document content."""
+
+    return bool(
+        re.fullmatch(
+            r"(?:(?:стр(?:аница)?\.?|page)\s*(?:№\s*)?\d+"
+            r"(?:\s*(?:из|of|/)\s*\d+)?|\d+\s*/\s*\d+)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _is_page_counter_segment(segment: SourceTextSegment, text: str) -> bool:
+    tokens = _tokens(text)
+    if tokens and all(token.isdigit() for token in tokens):
+        return True
+    if _looks_like_literal_page_number(text):
+        return True
+    if not segment.has_dynamic_page_field:
+        return False
+    page_words = {"стр", "страница", "page", "из", "of"}
+    return bool(tokens) and all(
+        token.isdigit()
+        or token in page_words
+        or bool(re.fullmatch(r"[ivxlcdm]+", token, re.IGNORECASE))
+        for token in tokens
+    )
+
+
+def _looks_like_ooxml_toc_entry(text: str) -> bool:
+    if re.search(r"(?:\.{2,}|\s{2,}|\t)\s*\d{1,4}$", text):
+        return True
+    return bool(
+        re.match(
+            r"^(?:\d+(?:\.\d+)*|(?:Приложение|Appendix)\s*№?\s*\d+).+\s+\d{1,4}$",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _normalize_source_text(text: str) -> str:
+    cleaned = text.replace("\xa0", " ").replace("\r", "\n")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _structured_inventory_segments(data: dict[str, Any]) -> list[str]:
+    metadata = data.get("metadata") or {}
+    block_segments: list[str] = []
+    for block in data.get("blocks") or []:
+        text = _normalize_source_text(str(block.get("text") or ""))
+        if not text:
+            continue
+        marker = ""
+        kind = str(block.get("kind") or "")
+        if kind == "heading":
+            marker = str(block.get("heading_number") or "")
+            if not marker:
+                path = block.get("section_path") or []
+                marker = str(path[-1]) if path else ""
+        elif kind in {"numbered_paragraph", "appendix_numbered_item"}:
+            marker = str(block.get("item_number") or "")
+        elif kind in {"letter_bullet", "appendix_bullet", "list_item"}:
+            marker = str(block.get("item_marker") or "")
+        rendered = _normalize_source_text(f"{marker} {text}")
+        occurrences = max(1, int(block.get("source_occurrences") or 1))
+        block_segments.extend([rendered] * occurrences)
+
+    metadata_segments: list[str] = []
+
+    def add(value: Any) -> None:
+        text = _normalize_source_text(str(value or ""))
+        if text:
+            metadata_segments.append(text)
+
+    index_code = metadata.get("index_code")
+    if index_code:
+        add(f"ИНДЕКС НД ИНДЕКС ЛНА {index_code}")
+    title_lines = metadata.get("title_lines") or []
+    if title_lines:
+        for line in title_lines:
+            add(line)
+    else:
+        add(metadata.get("display_title"))
+        add(metadata.get("document_kind"))
+    add(metadata.get("organization"))
+    if metadata.get("version"):
+        add(f"ВЕРСИЯ {metadata['version']}")
+    approval_date = metadata.get("approval_date")
+    approval_number = metadata.get("approval_order_number")
+    if approval_date or approval_number:
+        add(f"УТВЕРЖДЕНО приказом от {approval_date or ''} № {approval_number or ''}")
+    if metadata.get("effective_date"):
+        add(f"Введено в действие с {metadata['effective_date']}")
+    if metadata.get("declared_pages") is not None:
+        add(f"Листов {metadata['declared_pages']}")
+
+    result = list(block_segments)
+    block_tokens = [_tokens(value) for value in block_segments]
+    for segment in metadata_segments:
+        needle = _tokens(segment)
+        if needle and any(_token_subsequence_count(tokens, needle) for tokens in block_tokens):
+            continue
+        result.append(segment)
+    return result
+
+
+def _source_inventory_metrics(
+    inventory: dict[str, Any],
+    extracted_data: dict[str, Any],
+) -> dict[str, Any]:
+    source_segments: list[SourceTextSegment] = inventory["segments"]
+    actual_segments = _structured_inventory_segments(extracted_data)
+    expected_tokens = Counter(
+        token
+        for segment in source_segments
+        for token in _tokens(segment.text)
+    )
+    actual_tokens = Counter(
+        token
+        for segment in actual_segments
+        for token in _tokens(segment)
+    )
+    missing_tokens = expected_tokens - actual_tokens
+    expected_total = sum(expected_tokens.values())
+    missing_total = sum(missing_tokens.values())
+    coverage = 1.0 if not expected_total else (expected_total - missing_total) / expected_total
+
+    source_by_key: dict[tuple[str, ...], list[SourceTextSegment]] = defaultdict(list)
+    source_token_segments: list[list[str]] = []
+    for segment in source_segments:
+        tokens = _tokens(segment.text)
+        source_token_segments.append(tokens)
+        key = tuple(tokens)
+        if not key:
+            continue
+        source_by_key[key].append(segment)
+
+    actual_token_segments = [_tokens(segment) for segment in actual_segments]
+    missing_segment_samples: list[dict[str, Any]] = []
+    critical_missing_segments = 0
+    missing_segment_occurrences = 0
+    for key, examples in source_by_key.items():
+        expected_count = sum(
+            _token_subsequence_count(tokens, list(key))
+            for tokens in source_token_segments
+        )
+        actual_count = sum(
+            _token_subsequence_count(tokens, list(key))
+            for tokens in actual_token_segments
+        )
+        missing_count = max(0, expected_count - actual_count)
+        if not missing_count:
+            continue
+        critical = any(
+            item.story in {"footnote", "endnote"} or item.location == "textbox"
+            for item in examples
+        )
+        if not critical and not any(missing_tokens[token] for token in key):
+            continue
+        missing_segment_occurrences += missing_count
+        if critical:
+            critical_missing_segments += missing_count
+        if len(missing_segment_samples) < 30:
+            example = next(
+                (
+                    item
+                    for item in examples
+                    if item.story in {"footnote", "endnote"} or item.location == "textbox"
+                ),
+                examples[0],
+            )
+            missing_segment_samples.append(
+                {
+                    "part": example.part,
+                    "story": example.story,
+                    "location": example.location,
+                    "text": example.text[:320],
+                    "missing_occurrences": missing_count,
+                }
+            )
+
+    return {
+        "source_chars": sum(len(segment.text) for segment in source_segments),
+        "source_segments": len(source_segments),
+        "source_ignored_segments": len(inventory["ignored_segments"]),
+        "source_story_counts": inventory["story_counts"],
+        "source_location_counts": inventory["location_counts"],
+        "source_tokens": expected_total,
+        "source_missing_tokens": missing_total,
+        "source_token_coverage": round(coverage, 4),
+        "source_vocabulary_coverage": round(coverage, 4),
+        "source_missing_token_counts": dict(missing_tokens.most_common(50)),
+        "source_missing_segment_occurrences": missing_segment_occurrences,
+        "source_critical_missing_segments": critical_missing_segments,
+        "source_missing_segment_samples": missing_segment_samples,
+    }
+
+
+def _token_subsequence_count(haystack: list[str], needle: list[str]) -> int:
+    if not needle or len(needle) > len(haystack):
+        return 0
+    width = len(needle)
+    return sum(
+        haystack[index : index + width] == needle
+        for index in range(len(haystack) - width + 1)
     )
 
 
@@ -323,8 +894,12 @@ def _audit_artifact_inventory(
 
 def _resolve_artifact(directory: Path, raw_path: Any, fallback_name: str) -> Path:
     candidate = Path(str(raw_path or "")).expanduser()
-    if candidate.is_file():
+    if candidate.is_absolute() and candidate.is_file():
         return candidate.resolve()
+    if not candidate.is_absolute() and candidate.parts:
+        contained = (directory.parent / candidate).resolve()
+        if contained.is_relative_to(directory.parent) and contained.is_file():
+            return contained
     if candidate.name:
         fallback = directory / candidate.name
         if fallback.is_file():
@@ -530,7 +1105,6 @@ def _audit_document(
     fresh_data: dict[str, Any] | None = None
     try:
         fresh_data = extract_docx(source_file).to_dict()
-        source_text = _structured_document_text(fresh_data)
     except Exception as exc:
         _issue(
             issues,
@@ -540,7 +1114,6 @@ def _audit_document(
             doc_id=doc_id,
             source_name=source_name,
         )
-        source_text = ""
     if fresh_data is not None:
         report.update(
             _audit_extraction_snapshot(
@@ -551,32 +1124,64 @@ def _audit_document(
                 source_name=source_name,
             )
         )
-    extracted_text = "\n".join(str(block.get("text") or "") for block in blocks)
-    structured_text = _structured_document_text(data)
-    source_coverage = _vocabulary_coverage(source_text, structured_text)
-    report["source_chars"] = len(source_text)
-    report["extracted_chars"] = len(extracted_text)
-    report["source_vocabulary_coverage"] = round(source_coverage, 4)
-    if source_text and blocks and source_coverage < 0.7:
+
+    try:
+        source_inventory = _source_ooxml_inventory(source_file)
+        inventory_metrics = _source_inventory_metrics(source_inventory, data)
+        report.update(inventory_metrics)
+        coverage = float(inventory_metrics["source_token_coverage"])
+        missing_tokens = int(inventory_metrics["source_missing_tokens"])
+        critical_missing = int(inventory_metrics["source_critical_missing_segments"])
+        if missing_tokens or critical_missing:
+            level = (
+                "error"
+                if critical_missing or coverage < SOURCE_TEXT_ERROR_COVERAGE
+                else "warning"
+            )
+            _issue(
+                issues,
+                level,
+                "source_ooxml_text_missing",
+                (
+                    "Independent OOXML inventory found visible source text absent from "
+                    f"the structured extraction: {missing_tokens} tokens missing, "
+                    f"coverage {coverage:.1%}"
+                ),
+                doc_id=doc_id,
+                source_name=source_name,
+                details={
+                    "missing_token_counts": inventory_metrics["source_missing_token_counts"],
+                    "missing_segment_occurrences": inventory_metrics[
+                        "source_missing_segment_occurrences"
+                    ],
+                    "critical_missing_segments": critical_missing,
+                    "segment_samples": inventory_metrics["source_missing_segment_samples"],
+                    "story_counts": inventory_metrics["source_story_counts"],
+                },
+            )
+    except ValueError as exc:
+        report.update(
+            {
+                "source_chars": 0,
+                "source_segments": 0,
+                "source_ignored_segments": 0,
+                "source_tokens": 0,
+                "source_missing_tokens": 0,
+                "source_token_coverage": 0.0,
+                "source_vocabulary_coverage": 0.0,
+            }
+        )
         _issue(
             issues,
             "error",
-            "extraction_vocabulary_coverage_low",
-            f"Parser retained only {source_coverage:.1%} of source vocabulary",
+            "source_ooxml_inventory_failed",
+            str(exc),
             doc_id=doc_id,
             source_name=source_name,
-            details={"missing_terms": _missing_vocabulary(source_text, structured_text)},
         )
-    elif source_text and blocks and source_coverage < 0.9:
-        _issue(
-            issues,
-            "warning",
-            "extraction_vocabulary_coverage_partial",
-            f"Parser retained {source_coverage:.1%} of source vocabulary",
-            doc_id=doc_id,
-            source_name=source_name,
-            details={"missing_terms": _missing_vocabulary(source_text, structured_text)},
-        )
+
+    extracted_text = "\n".join(str(block.get("text") or "") for block in blocks)
+    report["extracted_chars"] = len(extracted_text)
 
     if len(chunk_records) != 1:
         if not chunk_records:
@@ -884,6 +1489,7 @@ def _audit_extraction_snapshot(
 
     metadata_fields = (
         "source_name",
+        "source_sha256",
         "index_code",
         "display_title",
         "document_kind",
@@ -1046,36 +1652,14 @@ def _block_signature(block: dict[str, Any]) -> tuple[Any, ...]:
         block.get("appendix_number"),
         block.get("appendix_title"),
         block.get("heading_level"),
+        block.get("heading_number"),
         tuple(block.get("section_path") or []),
+        tuple(block.get("section_labels") or []),
+        block.get("source_story"),
+        tuple(block.get("source_parts") or []),
+        tuple(block.get("source_locations") or []),
+        block.get("source_occurrences"),
     )
-
-
-def _structured_document_text(data: dict[str, Any]) -> str:
-    values: list[str] = [
-        "индекс нд индекс лна документ тип организация версия дата утверждения",
-        "номер приказа дата ввода в действие введено в действие листов файл",
-        "утверждено утвержден приказом приложение раздел пункт",
-    ]
-
-    def collect(value: Any) -> None:
-        if isinstance(value, dict):
-            for nested in value.values():
-                collect(nested)
-        elif isinstance(value, list):
-            for nested in value:
-                collect(nested)
-        elif isinstance(value, (str, int, float)) and not isinstance(value, bool):
-            text = str(value).strip()
-            if text:
-                values.append(text)
-
-    collect(data.get("metadata") or {})
-    collect(data.get("blocks") or [])
-    return "\n".join(values)
-
-
-def _missing_vocabulary(expected: str, actual: str, limit: int = 50) -> list[str]:
-    return sorted(set(_tokens(expected)) - set(_tokens(actual)))[:limit]
 
 
 def _audit_database(
@@ -1097,14 +1681,21 @@ def _audit_database(
         with connect(url) as conn:
             documents = list(
                 conn.execute(
-                    "SELECT doc_id, source_name, metadata FROM doc_documents ORDER BY doc_id"
+                    """
+                    SELECT doc_id, source_name, index_code, document_title, version, metadata
+                    FROM doc_documents
+                    ORDER BY doc_id
+                    """
                 ).fetchall()
             )
             chunks = list(
                 conn.execute(
                     """
-                    SELECT chunk_id, doc_id, source_name, raw_text, searchable_text,
-                           block_ids, char_count, embedding_model, metadata,
+                    SELECT chunk_id, doc_id, source_name, index_code, document_title, version,
+                           chunk_type, citation_label, raw_text, searchable_text, block_ids,
+                           section_path, section_labels, section_title, subsection_title,
+                           item_number, heading_number, appendix_number, appendix_title,
+                           char_count, embedding_model, metadata,
                            embedding IS NULL AS embedding_missing,
                            vector_dims(embedding) AS embedding_dim
                     FROM doc_chunks
@@ -1180,42 +1771,97 @@ def _audit_database(
         )
 
     mismatched_documents: list[str] = []
+    mismatched_document_fields: dict[str, list[str]] = {}
     for doc_id in sorted(set(expected_documents) & set(db_documents)):
         expected = expected_documents[doc_id]
         actual = db_documents[doc_id]
-        if (
-            str(expected.get("source_name") or "") != str(actual.get("source_name") or "")
-            or expected.get("metadata") != actual.get("metadata")
-        ):
+        metadata = expected.get("metadata") or {}
+        changed_fields = [
+            field
+            for field, expected_value, actual_value in (
+                ("source_name", expected.get("source_name"), actual.get("source_name")),
+                ("index_code", metadata.get("index_code"), actual.get("index_code")),
+                ("document_title", metadata.get("display_title"), actual.get("document_title")),
+                ("version", metadata.get("version"), actual.get("version")),
+                ("metadata", metadata, actual.get("metadata")),
+            )
+            if expected_value != actual_value
+        ]
+        if changed_fields:
             mismatched_documents.append(doc_id)
+            mismatched_document_fields[doc_id] = changed_fields
     if mismatched_documents:
         _issue(
             issues,
             "error",
             "database_document_content_mismatch",
             f"{len(mismatched_documents)} PostgreSQL documents differ from artifacts",
-            details={"doc_ids": mismatched_documents[:50]},
+            details={
+                "documents": {
+                    doc_id: mismatched_document_fields[doc_id]
+                    for doc_id in mismatched_documents[:50]
+                }
+            },
         )
 
     mismatched_chunks: list[str] = []
+    mismatched_chunk_fields: dict[str, list[str]] = {}
     for chunk_id in sorted(set(expected_chunks) & set(db_chunks)):
         expected = expected_chunks[chunk_id]
         actual = db_chunks[chunk_id]
-        if (
-            str(expected.get("raw_text") or "") != str(actual.get("raw_text") or "")
-            or str(expected.get("searchable_text") or "") != str(actual.get("searchable_text") or "")
-            or int(expected.get("char_count") or 0) != int(actual.get("char_count") or 0)
-            or list(expected.get("block_ids") or []) != list(actual.get("block_ids") or [])
-            or expected != actual.get("metadata")
-        ):
+        changed_fields = [
+            field
+            for field, expected_value, actual_value in (
+                ("doc_id", expected.get("doc_id"), actual.get("doc_id")),
+                ("source_name", expected.get("source_name"), actual.get("source_name")),
+                ("index_code", expected.get("index_code"), actual.get("index_code")),
+                ("document_title", expected.get("document_title"), actual.get("document_title")),
+                ("version", expected.get("version"), actual.get("version")),
+                ("chunk_type", expected.get("chunk_type"), actual.get("chunk_type")),
+                ("citation_label", expected.get("citation_label"), actual.get("citation_label")),
+                ("raw_text", expected.get("raw_text"), actual.get("raw_text")),
+                ("searchable_text", expected.get("searchable_text"), actual.get("searchable_text")),
+                (
+                    "block_ids",
+                    list(expected.get("block_ids") or []),
+                    list(actual.get("block_ids") or []),
+                ),
+                (
+                    "section_path",
+                    list(expected.get("section_path") or []),
+                    list(actual.get("section_path") or []),
+                ),
+                (
+                    "section_labels",
+                    list(expected.get("section_labels") or []),
+                    list(actual.get("section_labels") or []),
+                ),
+                ("section_title", expected.get("section_title"), actual.get("section_title")),
+                ("subsection_title", expected.get("subsection_title"), actual.get("subsection_title")),
+                ("item_number", expected.get("item_number"), actual.get("item_number")),
+                ("heading_number", expected.get("heading_number"), actual.get("heading_number")),
+                ("appendix_number", expected.get("appendix_number"), actual.get("appendix_number")),
+                ("appendix_title", expected.get("appendix_title"), actual.get("appendix_title")),
+                ("char_count", int(expected.get("char_count") or 0), int(actual.get("char_count") or 0)),
+                ("metadata", expected, actual.get("metadata")),
+            )
+            if expected_value != actual_value
+        ]
+        if changed_fields:
             mismatched_chunks.append(chunk_id)
+            mismatched_chunk_fields[chunk_id] = changed_fields
     if mismatched_chunks:
         _issue(
             issues,
             "error",
             "database_chunk_content_mismatch",
             f"{len(mismatched_chunks)} PostgreSQL chunks differ from artifacts",
-            details={"sample_chunk_ids": mismatched_chunks[:50]},
+            details={
+                "chunks": {
+                    chunk_id: mismatched_chunk_fields[chunk_id]
+                    for chunk_id in mismatched_chunks[:50]
+                }
+            },
         )
 
     if not any("embedding_hnsw" in name or "embedding_ivfflat" in name for name in indexes):
@@ -1295,13 +1941,6 @@ def _key(value: Any) -> str:
 
 def _tokens(text: str) -> list[str]:
     return [match.group(0).casefold() for match in WORD_RE.finditer(text)]
-
-
-def _vocabulary_coverage(expected: str, actual: str) -> float:
-    expected_tokens = set(_tokens(expected))
-    if not expected_tokens:
-        return 1.0
-    return len(expected_tokens & set(_tokens(actual))) / len(expected_tokens)
 
 
 def _token_coverage(expected: str, actual: str) -> float:

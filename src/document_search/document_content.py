@@ -11,7 +11,16 @@ def load_source_document_text(document: dict[str, Any]) -> str | None:
     source_path = find_source_document(document)
     if source_path is None:
         return None
-    return extract_docx_text(source_path)
+    metadata = document.get("metadata")
+    expected_hash = (
+        str(metadata.get("source_sha256") or "").strip().lower()
+        if isinstance(metadata, dict)
+        else ""
+    )
+    try:
+        return extract_docx_text(source_path, expected_sha256=expected_hash or None)
+    except (OSError, ValueError):
+        return None
 
 
 def find_source_document(

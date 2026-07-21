@@ -17,6 +17,12 @@ if str(SRC) not in sys.path:
 
 from document_search.chunker import DEFAULT_MAX_CHARS, chunk_document
 from document_search.extractor import extract_docx
+from corpus_candidate_integrity import (
+    CANDIDATE_SCHEMA_VERSION,
+    CANDIDATE_TOOL_VERSION,
+    build_integrity_manifest,
+    verify_candidate_integrity,
+)
 
 
 def discover_documents(docs_dir: Path) -> list[Path]:
@@ -130,7 +136,7 @@ def build_candidate(
     *,
     expected_documents: int | None = None,
     max_chars: int = DEFAULT_MAX_CHARS,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     docs_dir = docs_dir.resolve()
     output_dir = output_dir.resolve()
     if not docs_dir.is_dir():
@@ -159,6 +165,8 @@ def build_candidate(
         chunks_dir.mkdir(parents=True)
         extraction_manifest: list[dict[str, Any]] = []
         chunk_manifest: list[dict[str, Any]] = []
+        extracted_files: list[Path] = []
+        chunk_files: list[Path] = []
 
         for source_path, extracted, chunked in records:
             metadata = extracted["metadata"]
@@ -167,8 +175,8 @@ def build_candidate(
             chunks_name = f"{doc_id}.chunks.json"
             staged_extracted_path = extracted_dir / extracted_name
             staged_chunks_path = chunks_dir / chunks_name
-            final_extracted_path = output_dir / "extracted" / extracted_name
-            final_chunks_path = output_dir / "chunks" / chunks_name
+            final_extracted_path = Path("extracted") / extracted_name
+            final_chunks_path = Path("chunks") / chunks_name
 
             staged_extracted_path.write_text(
                 json.dumps(extracted, ensure_ascii=False, indent=2),
@@ -178,6 +186,8 @@ def build_candidate(
                 json.dumps(chunked, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            extracted_files.append(staged_extracted_path)
+            chunk_files.append(staged_chunks_path)
             extraction_manifest.append(
                 {
                     "source_name": metadata.get("source_name"),
@@ -205,6 +215,19 @@ def build_candidate(
             json.dumps(chunk_manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        summary = {
+            **summary,
+            "schema_version": CANDIDATE_SCHEMA_VERSION,
+            "tool_version": CANDIDATE_TOOL_VERSION,
+            "integrity": build_integrity_manifest(
+                docs_dir=docs_dir,
+                candidate_dir=staging_dir,
+                source_files=sources,
+                extracted_files=extracted_files,
+                chunk_files=chunk_files,
+            ),
+        }
+        verify_candidate_integrity(staging_dir, summary)
         report = {
             "status": "ready",
             "created_at": datetime.now(UTC).isoformat(),

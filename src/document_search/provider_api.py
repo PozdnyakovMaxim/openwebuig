@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+from functools import lru_cache
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 from urllib.error import HTTPError, URLError
@@ -14,6 +16,7 @@ from .settings import load_env_file
 
 LOCAL_EMBEDDING_NAMES = {"local", "sentence-transformers", "flagembedding", "flag"}
 PROVIDER_NAMES = {"provider", "api"}
+_EMBEDDER_CACHE_LOCK = threading.Lock()
 
 
 class ProviderEmbedder:
@@ -29,7 +32,14 @@ class ProviderEmbedder:
         load_env_file()
         self.base_url = _normalize_provider_base_url(base_url or os.getenv("PROVIDER_API_BASE_URL") or "")
         self.api_key = api_key or os.getenv("PROVIDER_API_KEY") or ""
-        self.model = model or os.getenv("PROVIDER_EMBED_MODEL") or ""
+        configured_model = os.getenv("PROVIDER_EMBED_MODEL") or ""
+        self.model = model or configured_model
+        configured_index_id = os.getenv("PROVIDER_EMBED_INDEX_ID") or ""
+        self.index_id = (
+            configured_index_id
+            if configured_index_id and (not model or self.model == configured_model)
+            else f"provider:{self.model}"
+        )
         self.timeout = timeout
         self.retries = retries
         if not self.base_url:
@@ -147,7 +157,25 @@ def make_embedder(
         engine = os.getenv("LOCAL_EMBED_ENGINE")
         if selected in {"sentence-transformers", "flagembedding", "flag"}:
             engine = selected
-        return LocalEmbedder(engine=engine, model=model)
+        resolved_model = model or os.getenv("LOCAL_EMBED_MODEL") or ""
+        configured_model = os.getenv("LOCAL_EMBED_MODEL") or ""
+        configured_index_id = os.getenv("LOCAL_EMBED_INDEX_ID") or ""
+        index_id = (
+            configured_index_id
+            if configured_index_id and (not model or resolved_model == configured_model)
+            else f"local:{resolved_model}"
+        )
+        with _EMBEDDER_CACHE_LOCK:
+            return _cached_local_embedder(
+                engine or "sentence-transformers",
+                resolved_model,
+                os.getenv("LOCAL_EMBED_DEVICE") or "",
+                int(os.getenv("LOCAL_EMBED_BATCH_SIZE") or "16"),
+                _env_bool("LOCAL_EMBED_NORMALIZE", True),
+                _env_bool("LOCAL_EMBED_USE_FP16", True),
+                int(os.getenv("LOCAL_EMBED_MAX_CONCURRENCY") or "1"),
+                index_id,
+            )
     if selected in PROVIDER_NAMES:
         return ProviderEmbedder(
             base_url=provider_api_base_url,
@@ -155,6 +183,34 @@ def make_embedder(
             model=model,
         )
     raise ValueError(f"Unknown embedding provider: {selected}")
+
+
+@lru_cache(maxsize=8)
+def _cached_local_embedder(
+    engine: str,
+    model: str,
+    device: str,
+    batch_size: int,
+    normalize: bool,
+    use_fp16: bool,
+    max_concurrency: int,
+    index_id: str,
+) -> LocalEmbedder:
+    return LocalEmbedder(
+        engine=engine,
+        model=model,
+        device=device or None,
+        batch_size=batch_size,
+        normalize=normalize,
+        use_fp16=use_fp16,
+        max_concurrency=max_concurrency,
+        index_id=index_id or None,
+    )
+
+
+def clear_embedder_cache() -> None:
+    with _EMBEDDER_CACHE_LOCK:
+        _cached_local_embedder.cache_clear()
 
 
 def make_chat(
@@ -224,3 +280,10 @@ def _normalize_provider_base_url(raw_url: str) -> str:
     if path in {"", "/"}:
         path = "/v1"
     return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment)).rstrip("/")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}

@@ -10,6 +10,13 @@ from typing import Any, Iterable
 
 DEFAULT_MAX_CHARS = 1800
 DEFAULT_MIN_PACK_CHARS = 320
+SUPPLEMENTAL_STORY_LABELS = {
+    "body": "дополнительный текст документа",
+    "header": "верхний колонтитул",
+    "footer": "нижний колонтитул",
+    "footnote": "сноска",
+    "endnote": "концевая сноска",
+}
 
 
 @dataclass
@@ -26,9 +33,11 @@ class Chunk:
     searchable_text: str
     block_ids: list[str]
     section_path: list[str] = field(default_factory=list)
+    section_labels: list[str] = field(default_factory=list)
     section_title: str | None = None
     subsection_title: str | None = None
     item_number: str | None = None
+    heading_number: str | None = None
     appendix_number: str | None = None
     appendix_title: str | None = None
     char_count: int = 0
@@ -66,6 +75,18 @@ class ChunkUnit:
         return list(self.first_block.get("section_path") or [])
 
     @property
+    def section_labels(self) -> list[str]:
+        return list(self.first_block.get("section_labels") or [])
+
+    @property
+    def heading_number(self) -> str | None:
+        return self.first_block.get("heading_number")
+
+    @property
+    def source_story(self) -> str | None:
+        return self.first_block.get("source_story")
+
+    @property
     def appendix_number(self) -> str | None:
         return self.first_block.get("appendix_number")
 
@@ -79,6 +100,8 @@ class ChunkUnit:
         if self.appendix_number != block.get("appendix_number"):
             return False
         if self.section_path != list(block.get("section_path") or []):
+            return False
+        if self.unit_type == "supplemental" and self.source_story != block.get("source_story"):
             return False
         candidate = self.raw_text + "\n" + _format_block_text(block)
         return len(candidate) <= max_chars
@@ -102,10 +125,23 @@ def _one_line(text: Any) -> str:
 def _format_block_text(block: dict[str, Any]) -> str:
     text = _normalize_space(str(block.get("text") or ""))
     kind = block.get("kind")
+    display_prefix = str(block.get("display_prefix") or "")
+    if display_prefix and kind in {
+        "heading",
+        "numbered_paragraph",
+        "appendix_numbered_item",
+        "appendix_bullet",
+        "list_item",
+    }:
+        return f"{display_prefix}{text}".strip()
+    if kind == "heading" and block.get("heading_number"):
+        return f"{block['heading_number']} {text}"
     if kind in {"numbered_paragraph", "appendix_numbered_item"} and block.get("item_number"):
         return f"{block['item_number']} {text}"
-    if kind in {"letter_bullet", "appendix_bullet"} and block.get("item_marker"):
-        return f"{block['item_marker']}) {text}"
+    if kind in {"letter_bullet", "appendix_bullet", "list_item"} and block.get("item_marker"):
+        marker = str(block["item_marker"]).strip()
+        suffix = ")" if re.fullmatch(r"[А-Яа-яЁёA-Za-z]", marker) else ""
+        return f"{marker}{suffix} {text}"
     return text
 
 
@@ -126,6 +162,8 @@ def _metadata_text(metadata: dict[str, Any]) -> str:
 
 
 def _section_label(unit: ChunkUnit) -> str:
+    if unit.section_labels:
+        return " / ".join(_one_line(label) for label in unit.section_labels if _one_line(label))
     parts: list[str] = []
     block = unit.first_block
     if block.get("section_number"):
@@ -148,7 +186,13 @@ def _citation_label(metadata: dict[str, Any], unit: ChunkUnit, part: int | None 
     if version:
         base += f" (версия {_one_line(version)})"
 
-    if unit.appendix_number:
+    if unit.unit_type == "supplemental":
+        story = SUPPLEMENTAL_STORY_LABELS.get(
+            str(unit.source_story or ""),
+            "дополнительный текст",
+        )
+        base += f", {story}"
+    elif unit.appendix_number:
         base += f", приложение № {_one_line(unit.appendix_number)}"
         if unit.appendix_title:
             base += f" {_one_line(unit.appendix_title)}"
@@ -174,7 +218,13 @@ def _context_text(metadata: dict[str, Any], unit: ChunkUnit) -> str:
         lines.append(f"Индекс: {_one_line(metadata['index_code'])}")
     if metadata.get("version"):
         lines.append(f"Версия: {_one_line(metadata['version'])}")
-    if unit.appendix_number:
+    if unit.unit_type == "supplemental":
+        story = SUPPLEMENTAL_STORY_LABELS.get(
+            str(unit.source_story or ""),
+            "дополнительный текст",
+        )
+        lines.append(f"Источник: {story}")
+    elif unit.appendix_number:
         appendix = f"Приложение № {_one_line(unit.appendix_number)}"
         if unit.appendix_title:
             appendix += f": {_one_line(unit.appendix_title)}"
@@ -267,9 +317,11 @@ def _make_chunk(
         searchable_text=searchable_text,
         block_ids=unit.block_ids,
         section_path=unit.section_path,
+        section_labels=unit.section_labels,
         section_title=_one_line(first.get("section_title")) or None,
         subsection_title=_one_line(first.get("subsection_title")) or None,
         item_number=unit.item_number,
+        heading_number=unit.heading_number,
         appendix_number=unit.appendix_number,
         appendix_title=_one_line(unit.appendix_title) or None,
         char_count=len(raw_text),
@@ -339,6 +391,18 @@ def chunk_document(
     for block in blocks:
         kind = block.get("kind")
 
+        if kind == "supplemental":
+            if (
+                current
+                and current.unit_type == "supplemental"
+                and current.can_absorb(block, max_chars)
+            ):
+                current.blocks.append(block)
+            else:
+                _flush_unit(chunks, metadata, current, max_chars)
+                current = ChunkUnit(unit_type="supplemental", blocks=[block])
+            continue
+
         if kind in {"front_matter", "heading", "appendix_heading", "appendix_title"}:
             _flush_unit(chunks, metadata, current, max_chars)
             current = None
@@ -361,7 +425,7 @@ def chunk_document(
             current = ChunkUnit(unit_type="appendix_item", blocks=[block])
             continue
 
-        if kind in {"letter_bullet", "appendix_bullet"}:
+        if kind in {"letter_bullet", "appendix_bullet", "list_item"}:
             if _same_parent_item(current, block) and current.can_absorb(block, max_chars):
                 current.blocks.append(block)
             else:
