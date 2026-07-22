@@ -13,15 +13,25 @@ if [[ -z "$api_key" ]]; then
   exit 1
 fi
 
+loader_api_key="${OPENWEBUI_DOCUMENT_LOADER_API_KEY:-}"
+if [[ -z "$loader_api_key" ]]; then
+  loader_api_key="$(PYTHONPATH=src python3 -c 'import os; from document_search.settings import load_env_file; load_env_file(); print(os.getenv("OPENWEBUI_DOCUMENT_LOADER_API_KEY") or "")')"
+fi
+if [[ -z "$loader_api_key" ]]; then
+  loader_api_key="$api_key"
+fi
+
 OPENAI_COMPAT_API_KEY="$api_key" \
 OPENAI_COMPAT_API_BASE_URL=http://host.docker.internal:8000/v1 \
+EXTERNAL_DOCUMENT_LOADER_URL=http://host.docker.internal:8000 \
+EXTERNAL_DOCUMENT_LOADER_API_KEY="$loader_api_key" \
 python3 scripts/fix_openwebui_model_access.py \
   --container document-search-webui \
   --model-id document-search-rag \
   --custom-model-id glavstroy-llm \
   --model-name ГлавстройLLM \
   --activate-pending
-unset api_key
+unset api_key loader_api_key
 
 python3 scripts/apply_openwebui_branding.py \
   --container document-search-webui \

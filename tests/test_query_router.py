@@ -80,8 +80,53 @@ class QueryRouterTest(unittest.TestCase):
 
         payload = json.loads(messages[1]["content"])
 
-        self.assertEqual(payload["resolved_reference"]["position"], 2)
-        self.assertIn("Регламент доступа", payload["resolved_reference"]["text"])
+        self.assertEqual(payload["resolved_reference"]["positions"], [2])
+        self.assertIn(
+            "Регламент доступа",
+            payload["resolved_reference"]["items"][0]["text"],
+        )
+
+    def test_router_tags_source_citation_separately_from_document_item(self) -> None:
+        history = [
+            {
+                "role": "assistant",
+                "content": "Ответ [2].\n\nИсточники:\n[1] Первый документ\n[2] Второй документ",
+            }
+        ]
+
+        citation_payload = json.loads(
+            build_router_messages("Раскрой источник [2]", chat_history=history)[1]["content"]
+        )
+        item_payload = json.loads(
+            build_router_messages("Раскрой пункт 2", chat_history=history)[1]["content"]
+        )
+
+        self.assertEqual(
+            citation_payload["resolved_reference"]["reference_type"],
+            "citation",
+        )
+        self.assertNotIn("resolved_reference", item_payload)
+
+    def test_router_returns_every_anchor_for_both_selection(self) -> None:
+        payload = json.loads(
+            build_router_messages(
+                "both",
+                chat_history=[
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "1. Политика — приложение № 2, пункт 2\n"
+                            "2. Политика — приложение № 3, пункт 2"
+                        ),
+                    }
+                ],
+            )[1]["content"]
+        )
+
+        reference = payload["resolved_reference"]
+        self.assertEqual(reference["selection"], "all")
+        self.assertEqual(len(reference["anchors"]), 2)
+        self.assertEqual(reference["anchors"][1]["appendix_number"], "3")
 
     def test_parser_accepts_json_inside_code_fence(self) -> None:
         decision = parse_route_decision(
@@ -153,6 +198,32 @@ class QueryRouterTest(unittest.TestCase):
                 section_query="пункт 2.3.1",
             ),
         )
+
+    def test_parser_keeps_composite_section_and_descendant_flag(self) -> None:
+        decision = parse_route_decision(
+            '{"route":"document_section","answer":"","document_query":"Политика ИБ",'
+            '"section_query":"приложение 3, пункт 2","include_descendants":true}'
+        )
+
+        self.assertEqual(
+            decision,
+            RouteDecision(
+                route="document_section",
+                document_query="Политика ИБ",
+                section_query="приложение 3, пункт 2",
+                include_descendants=True,
+            ),
+        )
+
+    def test_route_deterministically_marks_request_for_subitems(self) -> None:
+        chat = FakeChat(
+            '{"route":"document_section","answer":"",'
+            '"section_query":"пункт 2","include_descendants":false}'
+        )
+
+        decision = route_query(chat, "Покажи пункт 2 вместе с подпунктами")
+
+        self.assertTrue(decision.include_descendants)
 
     def test_document_section_without_document_can_be_resolved_globally(self) -> None:
         decision = parse_route_decision(

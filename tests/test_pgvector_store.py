@@ -7,7 +7,9 @@ from document_search.pgvector_store import (
     CORPUS_PROMOTION_ADVISORY_LOCK_KEY,
     acquire_corpus_read_lock,
     init_schema,
+    load_item_subtree,
     load_structural_chunks,
+    parse_structural_reference,
     upsert_chunk,
     validate_embedding_profile,
 )
@@ -185,6 +187,74 @@ class StructuralLookupTest(unittest.TestCase):
         self.assertEqual(len(conn.calls), 2)
         self.assertIn("item_number = %s", conn.calls[0][0])
         self.assertIn("section_path @>", conn.calls[1][0])
+
+    def test_composite_appendix_item_reference_is_one_exact_anchor(self) -> None:
+        conn = RecordingConnection()
+
+        load_structural_chunks(
+            conn,
+            "приложение № 3, пункт 2",
+            doc_id="policy",
+        )
+
+        query, parameters = conn.calls[0]
+        self.assertIn("item_number = %s", query)
+        self.assertIn("appendix_number = %s", query)
+        self.assertEqual(parameters, ("2", "3", "policy"))
+
+    def test_composite_reference_parser_accepts_reverse_word_order(self) -> None:
+        reference = parse_structural_reference("пункт 2 приложения № 3")
+
+        self.assertEqual(reference.kind, "item")
+        self.assertEqual(reference.number, "2")
+        self.assertEqual(reference.appendix_number, "3")
+        self.assertEqual(reference.canonical, "приложение № 3, пункт 2")
+
+    def test_bracketed_source_number_is_not_a_structural_reference(self) -> None:
+        conn = RecordingConnection()
+
+        self.assertIsNone(parse_structural_reference("[2]"))
+        self.assertEqual(load_structural_chunks(conn, "[2]"), [])
+        self.assertEqual(conn.calls, [])
+
+    def test_explicit_bracketed_item_stays_in_structural_namespace(self) -> None:
+        reference = parse_structural_reference("пункт [2]")
+
+        self.assertEqual(reference.kind, "item")
+        self.assertEqual(reference.number, "2")
+
+    def test_appendix_preposition_is_not_treated_as_a_letter_number(self) -> None:
+        self.assertIsNone(parse_structural_reference("Приложение к политике доступа"))
+
+    def test_item_subtree_includes_parent_and_dot_descendants(self) -> None:
+        conn = RecordingConnection()
+
+        load_structural_chunks(
+            conn,
+            "пункт 2",
+            doc_id="policy",
+            include_descendants=True,
+        )
+
+        query, parameters = conn.calls[0]
+        self.assertIn("item_number = %s", query)
+        self.assertIn("strpos(item_number, %s || '.') = 1", query)
+        self.assertEqual(parameters, ("2", "2", "policy"))
+
+    def test_item_subtree_helper_can_be_scoped_to_appendix(self) -> None:
+        conn = RecordingConnection()
+
+        load_item_subtree(
+            conn,
+            "2",
+            doc_id="policy",
+            appendix_number="3",
+        )
+
+        query, parameters = conn.calls[0]
+        self.assertIn("strpos(item_number, %s || '.') = 1", query)
+        self.assertIn("appendix_number = %s", query)
+        self.assertEqual(parameters, ("2", "2", "3", "policy"))
 
 
 class EmbeddingProfileTest(unittest.TestCase):

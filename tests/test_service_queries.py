@@ -4,7 +4,12 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from document_search.query_router import RouteDecision
-from document_search.rag_service import _select_document, answer_question
+from document_search.rag_service import (
+    _distinct_structural_anchors,
+    _resolved_structural_requests,
+    _select_document,
+    answer_question,
+)
 from document_search.service_queries import (
     document_not_found_answer,
     document_section_ambiguous_answer,
@@ -129,16 +134,31 @@ class ServiceQueriesTest(unittest.TestCase):
                 "doc_id": "backup",
                 "document_title": "Политика резервного копирования",
                 "source_name": "backup.docx",
+                "vector_score": 0.74,
+                "text_score": 0.08,
+                "vector_rank": 1,
+                "text_rank": 1,
+                "hybrid_score": 0.02,
             },
             {
                 "doc_id": "backup",
                 "document_title": "Политика резервного копирования",
                 "source_name": "backup.docx",
+                "vector_score": 0.69,
+                "text_score": 0.04,
+                "vector_rank": 2,
+                "text_rank": 2,
+                "hybrid_score": 0.018,
             },
             {
                 "doc_id": "security",
                 "document_title": "Политика информационной безопасности",
                 "source_name": "security.docx",
+                "vector_score": 0.36,
+                "text_score": 0.0,
+                "vector_rank": 90,
+                "text_rank": 999999,
+                "hybrid_score": 0.004,
             },
         ]
         with (
@@ -164,7 +184,7 @@ class ServiceQueriesTest(unittest.TestCase):
         self.assertEqual(answer.route, "documents")
         self.assertIn("по теме «резервное копирование»", answer.answer)
         self.assertEqual(answer.answer.count("Политика резервного копирования"), 1)
-        self.assertIn("Политика информационной безопасности", answer.answer)
+        self.assertNotIn("Политика информационной безопасности", answer.answer)
         list_documents.assert_not_called()
         validate_profile.assert_called_once_with(
             connection,
@@ -317,7 +337,12 @@ class ServiceQueriesTest(unittest.TestCase):
         self.assertEqual(answer.route, "document_section")
         self.assertIn("2.3 Резервные копии", answer.answer)
         self.assertEqual(answer.sources, ["Политика резервного копирования, пункт 2.3"])
-        load_structural_chunks.assert_called_once_with(connection, "2.3", doc_id="backup")
+        load_structural_chunks.assert_called_once_with(
+            connection,
+            "2.3",
+            doc_id="backup",
+            include_descendants=False,
+        )
         make_embedder.assert_not_called()
 
     def test_global_exact_section_asks_to_disambiguate_multiple_documents(self) -> None:
@@ -398,6 +423,236 @@ class ServiceQueriesTest(unittest.TestCase):
         self.assertIn("приложение № 1", answer.answer)
         self.assertIn("приложение № 2", answer.answer)
         self.assertEqual(answer.rows, [])
+
+    def test_item_with_descendants_is_returned_as_one_structural_subtree(self) -> None:
+        connection = MagicMock()
+        connection_context = MagicMock()
+        connection_context.__enter__.return_value = connection
+        rows = [
+            {
+                "doc_id": "backup",
+                "document_title": "Политика резервного копирования",
+                "chunk_id": "backup::2",
+                "block_ids": ["item-2"],
+                "raw_text": "2 Основное требование",
+                "item_number": "2",
+                "structural_match": "item",
+                "citation_label": "Политика, пункт 2",
+            },
+            {
+                "doc_id": "backup",
+                "document_title": "Политика резервного копирования",
+                "chunk_id": "backup::2.1",
+                "block_ids": ["item-2.1"],
+                "raw_text": "2.1 Подпункт требования",
+                "item_number": "2.1",
+                "structural_match": "item",
+                "citation_label": "Политика, пункт 2.1",
+            },
+        ]
+        with (
+            patch("document_search.rag_service.make_chat", return_value=MagicMock()),
+            patch(
+                "document_search.rag_service.route_query",
+                return_value=RouteDecision(
+                    route="document_section",
+                    section_query="пункт 2",
+                    include_descendants=True,
+                ),
+            ),
+            patch("document_search.rag_service.connect", return_value=connection_context),
+            patch(
+                "document_search.rag_service.load_structural_chunks",
+                return_value=rows,
+            ) as load_structural_chunks,
+        ):
+            answer = answer_question(
+                "Покажи пункт 2 вместе с подпунктами",
+                chat_model="test-model",
+            )
+
+        self.assertIn("2 Основное требование", answer.answer)
+        self.assertIn("2.1 Подпункт требования", answer.answer)
+        self.assertNotIn("нескольких местах", answer.answer)
+        load_structural_chunks.assert_called_once_with(
+            connection,
+            "пункт 2",
+            include_descendants=True,
+        )
+
+    def test_both_structural_options_are_loaded_and_combined(self) -> None:
+        connection = MagicMock()
+        connection_context = MagicMock()
+        connection_context.__enter__.return_value = connection
+        document = {
+            "doc_id": "backup",
+            "document_title": "Политика",
+            "source_name": "backup.docx",
+            "match_score": 1.0,
+        }
+        selected_rows = [
+            [
+                {
+                    **document,
+                    "chunk_id": "backup::app2-item2",
+                    "raw_text": "Приложение 2, пункт 2",
+                    "item_number": "2",
+                    "appendix_number": "2",
+                    "structural_match": "item",
+                    "citation_label": "Политика, приложение 2, пункт 2",
+                }
+            ],
+            [
+                {
+                    **document,
+                    "chunk_id": "backup::app3-item2",
+                    "raw_text": "Приложение 3, пункт 2",
+                    "item_number": "2",
+                    "appendix_number": "3",
+                    "structural_match": "item",
+                    "citation_label": "Политика, приложение 3, пункт 2",
+                }
+            ],
+        ]
+        resolved_reference = {
+            "reference_type": "list_selection",
+            "selection": "all",
+            "anchors": [
+                {
+                    "document_query": "Политика (backup.docx)",
+                    "section_query": "приложение № 2, пункт 2",
+                },
+                {
+                    "document_query": "Политика (backup.docx)",
+                    "section_query": "приложение № 3, пункт 2",
+                },
+            ],
+        }
+        with (
+            patch("document_search.rag_service.make_chat", return_value=MagicMock()),
+            patch(
+                "document_search.rag_service.route_query",
+                return_value=RouteDecision(
+                    route="rag",
+                    resolved_reference=resolved_reference,
+                ),
+            ),
+            patch("document_search.rag_service.connect", return_value=connection_context),
+            patch("document_search.rag_service.find_documents", return_value=[document]),
+            patch(
+                "document_search.rag_service.load_structural_chunks",
+                side_effect=selected_rows,
+            ) as load_structural_chunks,
+            patch("document_search.rag_service.make_embedder") as make_embedder,
+        ):
+            answer = answer_question("оба", chat_model="test-model")
+
+        self.assertEqual(answer.route, "document_section")
+        self.assertIn("Приложение 2, пункт 2", answer.answer)
+        self.assertIn("Приложение 3, пункт 2", answer.answer)
+        self.assertEqual(load_structural_chunks.call_count, 2)
+        self.assertEqual(len(answer.rows), 2)
+        make_embedder.assert_not_called()
+
+    def test_implicit_reference_to_multiple_citations_asks_for_source(self) -> None:
+        resolved_reference = {
+            "reference_type": "citation_ambiguity",
+            "items": [
+                {"source_number": 1, "text": "Политика, пункт 3.1"},
+                {"source_number": 2, "text": "Политика, пункт 4.2"},
+            ],
+        }
+        with (
+            patch("document_search.rag_service.make_chat", return_value=MagicMock()),
+            patch(
+                "document_search.rag_service.route_query",
+                return_value=RouteDecision(
+                    route="rag",
+                    resolved_reference=resolved_reference,
+                ),
+            ),
+            patch("document_search.rag_service.connect") as connect,
+        ):
+            answer = answer_question(
+                "Выведи подпункт, на который ты сослался",
+                chat_model="test-model",
+            )
+
+        self.assertEqual(answer.route, "document_section")
+        self.assertIn("Источник [1]", answer.answer)
+        self.assertIn("Источник [2]", answer.answer)
+        connect.assert_not_called()
+
+    def test_citation_document_does_not_replace_explicit_requested_item(self) -> None:
+        decision = RouteDecision(
+            route="document_section",
+            section_query="пункт 3",
+            resolved_reference={
+                "reference_type": "citation",
+                "anchors": [
+                    {
+                        "document_query": "Политика доступа",
+                        "section_query": "пункт 4.2",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(
+            _resolved_structural_requests(decision),
+            [
+                {
+                    "document_query": "Политика доступа",
+                    "section_query": "пункт 3",
+                }
+            ],
+        )
+
+    def test_ambiguous_both_returns_clarification_without_database(self) -> None:
+        resolved_reference = {
+            "reference_type": "list_selection_ambiguity",
+            "available_count": 3,
+        }
+        with (
+            patch("document_search.rag_service.make_chat", return_value=MagicMock()),
+            patch(
+                "document_search.rag_service.route_query",
+                return_value=RouteDecision(
+                    route="rag",
+                    resolved_reference=resolved_reference,
+                ),
+            ),
+            patch("document_search.rag_service.connect") as connect,
+        ):
+            answer = answer_question("оба", chat_model="test-model")
+
+        self.assertEqual(answer.route, "document_section")
+        self.assertIn("3 вариантов", answer.answer)
+        connect.assert_not_called()
+
+    def test_same_item_subtrees_in_different_sections_remain_ambiguous(self) -> None:
+        rows = [
+            {
+                "doc_id": "policy",
+                "item_number": "2",
+                "section_path": ["1"],
+                "structural_match": "item",
+            },
+            {
+                "doc_id": "policy",
+                "item_number": "2",
+                "section_path": ["4"],
+                "structural_match": "item",
+            },
+        ]
+
+        anchors = _distinct_structural_anchors(
+            rows,
+            "пункт 2",
+            include_descendants=True,
+        )
+
+        self.assertEqual(len(anchors), 2)
 
 
 if __name__ == "__main__":
