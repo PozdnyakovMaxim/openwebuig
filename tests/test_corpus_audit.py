@@ -16,6 +16,46 @@ from document_search.extractor import extract_docx, write_extraction
 
 
 class CorpusAuditTest(unittest.TestCase):
+    def test_plain_duplicate_does_not_create_a_false_missing_textbox_error(self) -> None:
+        text = "КОММЕРЧЕСКАЯ ТАЙНА"
+        inventory = {
+            "segments": [
+                corpus_audit_module.SourceTextSegment(
+                    part="word/document.xml",
+                    story="body",
+                    text=text,
+                    location="paragraph",
+                ),
+                corpus_audit_module.SourceTextSegment(
+                    part="word/document.xml",
+                    story="body",
+                    text=text,
+                    location="textbox",
+                ),
+            ],
+            "ignored_segments": [],
+            "story_counts": {"body": 2},
+            "location_counts": {"paragraph": 1, "textbox": 1},
+        }
+        extracted = {
+            "metadata": {},
+            "blocks": [
+                {
+                    "kind": "supplemental",
+                    "text": text,
+                    "source_story": "body",
+                    "source_locations": ["textbox"],
+                    "source_occurrences": 1,
+                }
+            ],
+        }
+
+        metrics = corpus_audit_module._source_inventory_metrics(inventory, extracted)
+
+        self.assertEqual(metrics["source_missing_tokens"], 2)
+        self.assertEqual(metrics["source_actionable_missing_segments"], 0)
+        self.assertEqual(metrics["source_critical_missing_segments"], 0)
+
     def test_clean_artifacts_pass(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             paths = self._build_corpus(Path(temporary_directory))
