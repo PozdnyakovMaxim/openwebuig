@@ -3,15 +3,29 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import time
 import uuid
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from .chat_history import content_to_text, normalize_history
+from .external_document_loader import (
+    DocumentTooLargeError,
+    InvalidDocumentError,
+    UnsupportedDocumentError,
+    process_external_document,
+)
+from .openwebui_context import (
+    OpenWebUIContext,
+    build_openwebui_context_messages,
+    clean_openwebui_history,
+    parse_openwebui_context,
+)
 from .pgvector_store import (
     acquire_corpus_read_lock,
     connect,
@@ -20,8 +34,8 @@ from .pgvector_store import (
     resolve_embedding_index_id,
     validate_embedding_profile,
 )
-from .provider_api import make_embedder
-from .rag_service import answer_question, append_sources
+from .provider_api import make_chat, make_embedder
+from .rag_service import RagAnswer, answer_question, append_sources, has_chat_config
 from .settings import load_env_file
 
 
@@ -101,6 +115,53 @@ def list_models(authorization: str | None = Header(default=None)) -> ModelsRespo
     return ModelsResponse(data=[ModelInfo(id=_model_id())])
 
 
+@app.put("/process", response_model=None)
+async def process_document(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    content_type: str = Header(default="", alias="Content-Type"),
+    x_filename: str = Header(default="document.docx", alias="X-Filename"),
+) -> dict[str, object]:
+    """Open WebUI ExternalDocumentLoader endpoint.
+
+    The official loader sends raw file bytes with PUT, Authorization,
+    Content-Type and X-Filename headers and expects page_content/metadata JSON.
+    """
+
+    _check_document_loader_auth(authorization)
+    max_bytes = _document_max_bytes()
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header") from None
+        if declared_length < 0:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length header")
+        if declared_length > max_bytes:
+            raise HTTPException(status_code=413, detail="Uploaded document is too large")
+
+    payload = bytearray()
+    async for chunk in request.stream():
+        if len(payload) + len(chunk) > max_bytes:
+            raise HTTPException(status_code=413, detail="Uploaded document is too large")
+        payload.extend(chunk)
+    try:
+        return await run_in_threadpool(
+            process_external_document,
+            bytes(payload),
+            filename=x_filename,
+            content_type=content_type,
+            max_bytes=max_bytes,
+        )
+    except DocumentTooLargeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except UnsupportedDocumentError as exc:
+        raise HTTPException(status_code=415, detail=str(exc)) from exc
+    except InvalidDocumentError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/v1/chat/completions", response_model=None)
 def chat_completions(
     request: ChatCompletionRequest,
@@ -112,18 +173,23 @@ def chat_completions(
     if not query:
         raise HTTPException(status_code=400, detail="No user message was provided.")
 
-    limit = int(os.getenv("RAG_RETRIEVAL_LIMIT") or "6")
-    chat_history_limit = int(os.getenv("RAG_CHAT_HISTORY_LIMIT") or "24")
-    chat_history = normalize_history(request.messages, max_messages=chat_history_limit)
-    force_extractive = _env_bool("RAG_FORCE_EXTRACTIVE", False)
-    rag_answer = answer_question(
-        query,
-        limit=limit,
-        chat_history=chat_history,
-        extractive=force_extractive,
-        temperature=float(request.temperature or 0.0),
-    )
-    content = append_sources(rag_answer)
+    openwebui_context = parse_openwebui_context(request.messages)
+    if openwebui_context is not None:
+        rag_answer = _answer_openwebui_context(request, openwebui_context)
+        content = rag_answer.answer
+    else:
+        limit = int(os.getenv("RAG_RETRIEVAL_LIMIT") or "6")
+        chat_history_limit = int(os.getenv("RAG_CHAT_HISTORY_LIMIT") or "24")
+        chat_history = normalize_history(request.messages, max_messages=chat_history_limit)
+        force_extractive = _env_bool("RAG_FORCE_EXTRACTIVE", False)
+        rag_answer = answer_question(
+            query,
+            limit=limit,
+            chat_history=chat_history,
+            extractive=force_extractive,
+            temperature=float(request.temperature or 0.0),
+        )
+        content = append_sources(rag_answer)
     headers = _timing_headers(rag_answer.route, rag_answer.timings_ms)
     logger.info(
         "rag_request route=%s mode=%s timings_ms=%s",
@@ -178,6 +244,73 @@ def _check_auth(authorization: str | None) -> None:
         return
     if authorization != f"Bearer {expected}":
         raise HTTPException(status_code=401, detail="Invalid API key.")
+
+
+def _check_document_loader_auth(authorization: str | None) -> None:
+    load_env_file()
+    expected = (
+        os.getenv("OPENWEBUI_DOCUMENT_LOADER_API_KEY")
+        or os.getenv("OPENAI_COMPAT_API_KEY")
+        or ""
+    )
+    if not expected:
+        raise HTTPException(status_code=503, detail="Document loader API key is not configured")
+    supplied = authorization.removeprefix("Bearer ") if authorization else ""
+    if not secrets.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="Invalid API key.")
+
+
+def _document_max_bytes() -> int:
+    raw_value = os.getenv("OPENWEBUI_DOCUMENT_MAX_BYTES") or str(64 * 1024 * 1024)
+    try:
+        max_bytes = int(raw_value)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=503,
+            detail="OPENWEBUI_DOCUMENT_MAX_BYTES must be a positive integer",
+        ) from None
+    if max_bytes <= 0:
+        raise HTTPException(
+            status_code=503,
+            detail="OPENWEBUI_DOCUMENT_MAX_BYTES must be a positive integer",
+        )
+    return max_bytes
+
+
+def _answer_openwebui_context(
+    request: ChatCompletionRequest,
+    context: OpenWebUIContext,
+) -> RagAnswer:
+    started = time.perf_counter()
+    if not has_chat_config():
+        raise HTTPException(status_code=503, detail="Chat provider is not configured")
+    history = clean_openwebui_history(
+        request.messages,
+        max_messages=int(os.getenv("RAG_CHAT_HISTORY_LIMIT") or "24"),
+    )
+    messages = build_openwebui_context_messages(
+        context,
+        history=history,
+        max_context_chars=int(os.getenv("OPENWEBUI_CONTEXT_MAX_CHARS") or "60000"),
+    )
+    chat = make_chat()
+    generation_started = time.perf_counter()
+    answer = chat.complete(
+        messages,
+        temperature=float(request.temperature or 0.0),
+        max_tokens=request.max_tokens,
+    )
+    generation_ms = round((time.perf_counter() - generation_started) * 1000, 2)
+    total_ms = round((time.perf_counter() - started) * 1000, 2)
+    return RagAnswer(
+        query=context.query,
+        answer=answer,
+        sources=[],
+        rows=[],
+        mode="generated",
+        route="file_context",
+        timings_ms={"generation": generation_ms, "total": total_ms},
+    )
 
 
 def _last_user_text(messages: list[ChatMessage]) -> str:

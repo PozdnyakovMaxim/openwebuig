@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import os
 import re
@@ -13,6 +14,45 @@ CORPUS_PROMOTION_ADVISORY_LOCK_KEY = int.from_bytes(
     byteorder="big",
     signed=True,
 )
+STRUCTURAL_NUMBER_PATTERN = (
+    r"(?:\d+(?:\.[0-9A-Za-zА-Яа-яЁё]+)*|[IVXLCDM]+|[A-Za-zА-Яа-яЁё])"
+)
+APPENDIX_REFERENCE_RE = re.compile(
+    rf"\b(?:приложени\w*|appendix)\s*(?:№|no\.?|#)?\s*"
+    rf"\[?(?P<number>{STRUCTURAL_NUMBER_PATTERN})\]?(?!\w)",
+    re.IGNORECASE,
+)
+ITEM_REFERENCE_RE = re.compile(
+    rf"\b(?:подпункт\w*|пункт\w*|п\.|item)\s*(?:№|#)?\s*"
+    rf"\[?(?P<number>{STRUCTURAL_NUMBER_PATTERN})\]?(?!\w)",
+    re.IGNORECASE,
+)
+SECTION_REFERENCE_RE = re.compile(
+    rf"\b(?:раздел\w*|section)\s*(?:№|#)?\s*"
+    rf"\[?(?P<number>{STRUCTURAL_NUMBER_PATTERN})\]?(?!\w)",
+    re.IGNORECASE,
+)
+BARE_STRUCTURAL_REFERENCE_RE = re.compile(
+    r"^\s*(?P<number>(?:\d+(?:\.[0-9A-Za-zА-Яа-яЁё]+)*|[IVXLCDM]+|"
+    r"[A-Za-zА-Яа-яЁё]))\s*$",
+    re.IGNORECASE,
+)
+LOWERCASE_SINGLE_LETTER_STOPWORDS = {"a", "i", "в", "и", "к", "о", "с"}
+
+
+@dataclass(frozen=True)
+class StructuralReference:
+    kind: str
+    number: str
+    appendix_number: str | None = None
+
+    @property
+    def canonical(self) -> str:
+        if self.kind == "item" and self.appendix_number:
+            return f"приложение № {self.appendix_number}, пункт {self.number}"
+        labels = {"item": "пункт", "section": "раздел", "appendix": "приложение №"}
+        label = labels.get(self.kind, "")
+        return f"{label} {self.number}".strip()
 
 
 def database_url(value: str | None = None) -> str:
@@ -376,65 +416,63 @@ def load_structural_chunks(
     section_reference: str,
     *,
     doc_id: str | None = None,
+    include_descendants: bool = False,
 ) -> list[dict[str, Any]]:
     """Load an exact item or a complete section subtree without semantic search."""
 
-    reference = section_reference.strip()
-    if not reference:
+    reference = parse_structural_reference(section_reference)
+    if reference is None:
         return []
 
-    appendix_match = re.fullmatch(
-        r"(?:приложение|appendix)\s*(?:№|no\.?|#)?\s*(.+)",
-        reference,
-        re.IGNORECASE,
-    )
-    if appendix_match:
-        normalized_reference = appendix_match.group(1).strip()
+    if reference.kind == "appendix":
         return _load_structural_match(
             conn,
             predicate="appendix_number = %s",
-            parameters=[normalized_reference],
+            parameters=[reference.number],
             match_type="appendix",
             doc_id=doc_id,
-        ) if normalized_reference else []
+        )
 
-    item_match = re.fullmatch(
-        r"(?:пункт|п\.)\s*(?:№|#)?\s*(.+)",
-        reference,
-        re.IGNORECASE,
-    )
-    if item_match:
-        normalized_reference = item_match.group(1).strip()
+    if reference.kind == "item":
+        predicate, parameters = _item_match_predicate(
+            reference.number,
+            include_descendants=include_descendants,
+        )
+        if reference.appendix_number:
+            predicate = f"({predicate}) AND appendix_number = %s"
+            parameters.append(reference.appendix_number)
         return _load_structural_match(
             conn,
-            predicate="item_number = %s",
-            parameters=[normalized_reference],
+            predicate=predicate,
+            parameters=parameters,
             match_type="item",
             doc_id=doc_id,
-        ) if normalized_reference else []
+        )
 
-    section_match = re.fullmatch(
-        r"(?:раздел|section)\s*(?:№|#)?\s*(.+)",
-        reference,
-        re.IGNORECASE,
-    )
-    if section_match:
-        normalized_reference = section_match.group(1).strip()
+    if reference.kind == "section":
+        predicate = "(heading_number = %s OR section_path @> ARRAY[%s]::text[])"
+        parameters = [reference.number, reference.number]
+        if reference.appendix_number:
+            predicate += " AND appendix_number = %s"
+            parameters.append(reference.appendix_number)
         return _load_structural_match(
             conn,
-            predicate="(heading_number = %s OR section_path @> ARRAY[%s]::text[])",
-            parameters=[normalized_reference, normalized_reference],
+            predicate=predicate,
+            parameters=parameters,
             match_type="section",
             doc_id=doc_id,
-        ) if normalized_reference else []
+        )
 
     # Legacy/bare references prefer an exact item. Only if no item exists do
     # they fall back to a section subtree; this avoids merging unrelated anchors.
-    normalized_reference = reference
+    predicate, parameters = _item_match_predicate(
+        reference.number,
+        include_descendants=include_descendants,
+    )
     rows = _load_structural_match(
         conn,
-        predicate="item_number = %s",
-        parameters=[normalized_reference],
+        predicate=predicate,
+        parameters=parameters,
         match_type="item",
         doc_id=doc_id,
     )
@@ -443,10 +481,101 @@ def load_structural_chunks(
     return _load_structural_match(
         conn,
         predicate="(heading_number = %s OR section_path @> ARRAY[%s]::text[])",
-        parameters=[normalized_reference, normalized_reference],
+        parameters=[reference.number, reference.number],
         match_type="section",
         doc_id=doc_id,
     )
+
+
+def parse_structural_reference(section_reference: str) -> StructuralReference | None:
+    """Parse exact and composite references without treating source ordinals as items."""
+
+    reference = " ".join(section_reference.strip().split())
+    if not reference:
+        return None
+    # Bracketed numbers are source citations unless a structural keyword makes
+    # their namespace explicit. The router resolves those citations separately.
+    if re.fullmatch(r"\[\d{1,3}]", reference):
+        return None
+
+    appendix_match = APPENDIX_REFERENCE_RE.search(reference)
+    item_match = ITEM_REFERENCE_RE.search(reference)
+    section_match = SECTION_REFERENCE_RE.search(reference)
+    appendix_match = _validated_structural_match(appendix_match)
+    item_match = _validated_structural_match(item_match)
+    section_match = _validated_structural_match(section_match)
+    if item_match:
+        return StructuralReference(
+            kind="item",
+            number=item_match.group("number"),
+            appendix_number=(appendix_match.group("number") if appendix_match else None),
+        )
+    if section_match:
+        return StructuralReference(
+            kind="section",
+            number=section_match.group("number"),
+            appendix_number=(appendix_match.group("number") if appendix_match else None),
+        )
+    if appendix_match:
+        return StructuralReference(kind="appendix", number=appendix_match.group("number"))
+    bare_match = BARE_STRUCTURAL_REFERENCE_RE.fullmatch(reference)
+    if bare_match:
+        return StructuralReference(kind="bare", number=bare_match.group("number"))
+    return None
+
+
+def _validated_structural_match(match: re.Match[str] | None) -> re.Match[str] | None:
+    if match is None:
+        return None
+    number = match.group("number")
+    if (
+        len(number) == 1
+        and number.isalpha()
+        and number == number.casefold()
+        and number.casefold() in LOWERCASE_SINGLE_LETTER_STOPWORDS
+    ):
+        return None
+    return match
+
+
+def load_item_subtree(
+    conn: Any,
+    item_number: str,
+    *,
+    doc_id: str | None = None,
+    appendix_number: str | None = None,
+) -> list[dict[str, Any]]:
+    """Load item N and descendants N.1, N.1.1, ... in document order."""
+
+    number_match = BARE_STRUCTURAL_REFERENCE_RE.fullmatch(item_number.strip())
+    if not number_match:
+        return []
+    number = number_match.group("number")
+    predicate, parameters = _item_match_predicate(number, include_descendants=True)
+    normalized_appendix = str(appendix_number or "").strip()
+    if normalized_appendix:
+        predicate = f"({predicate}) AND appendix_number = %s"
+        parameters.append(normalized_appendix)
+    return _load_structural_match(
+        conn,
+        predicate=predicate,
+        parameters=parameters,
+        match_type="item",
+        doc_id=doc_id,
+    )
+
+
+def _item_match_predicate(
+    item_number: str,
+    *,
+    include_descendants: bool,
+) -> tuple[str, list[Any]]:
+    if include_descendants:
+        return (
+            "(item_number = %s OR strpos(item_number, %s || '.') = 1)",
+            [item_number, item_number],
+        )
+    return "item_number = %s", [item_number]
 
 
 def _load_structural_match(

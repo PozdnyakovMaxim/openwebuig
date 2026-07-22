@@ -9,6 +9,7 @@ from typing import Any
 from .answering import build_messages, extractive_answer
 from .chat_history import build_retrieval_query
 from .document_content import load_source_document_text
+from .document_ranking import rank_documents
 from .pgvector_store import (
     acquire_corpus_read_lock,
     connect,
@@ -17,6 +18,7 @@ from .pgvector_store import (
     list_documents,
     load_document_chunks,
     load_structural_chunks,
+    parse_structural_reference,
     resolve_embedding_index_id,
     validate_embedding_profile,
 )
@@ -87,6 +89,25 @@ def answer_question(
         decision = RouteDecision(route="rag")
     routing_ms = _elapsed_ms(routing_started)
     service_route = decision.route
+    if (decision.resolved_reference or {}).get("reference_type") == "citation_ambiguity":
+        return _service_answer(
+            query,
+            _citation_ambiguity_answer(decision.resolved_reference or {}),
+            "document_section",
+            started,
+            routing_ms=routing_ms,
+        )
+    if (decision.resolved_reference or {}).get("reference_type") == "list_selection_ambiguity":
+        return _service_answer(
+            query,
+            _list_selection_ambiguity_answer(decision.resolved_reference or {}),
+            "document_section",
+            started,
+            routing_ms=routing_ms,
+        )
+    structural_requests = _resolved_structural_requests(decision)
+    if structural_requests and (decision.resolved_reference or {}).get("reference_type") == "list_selection":
+        service_route = "document_section"
 
     if service_route == "identity":
         return _service_answer(query, identity_answer(), service_route, started, routing_ms=routing_ms)
@@ -124,7 +145,7 @@ def answer_question(
             timings_ms=timings,
         )
     if service_route == "document_section":
-        if not decision.section_query:
+        if not structural_requests:
             return _service_answer(
                 query,
                 decision.answer or "Уточните номер пункта или раздела.",
@@ -132,62 +153,13 @@ def answer_question(
                 started,
                 routing_ms=routing_ms,
             )
-        database_started = time.perf_counter()
-        candidates: list[dict[str, Any]] = []
-        document: dict[str, Any] | None = None
-        with connect(database_url(database_url_override)) as conn:
-            acquire_corpus_read_lock(conn)
-            if decision.document_query:
-                candidates = find_documents(conn, decision.document_query)
-                document = _select_document(candidates, decision.document_query)
-                rows = (
-                    load_structural_chunks(
-                        conn,
-                        decision.section_query,
-                        doc_id=str(document["doc_id"]),
-                    )
-                    if document
-                    else []
-                )
-            else:
-                rows = load_structural_chunks(conn, decision.section_query)
-        timings = {
-            "routing": routing_ms,
-            "database": _elapsed_ms(database_started),
-            "total": _elapsed_ms(started),
-        }
-        if decision.document_query and document is None:
-            content = document_not_found_answer(decision.document_query, candidates)
-            sources: list[str] = []
-        else:
-            structural_anchors = _distinct_structural_anchors(
-                rows,
-                decision.section_query,
-            )
-            if len(structural_anchors) > 1:
-                content = document_section_ambiguous_answer(
-                    decision.section_query,
-                    structural_anchors,
-                )
-                sources = []
-                rows = []
-            elif not rows:
-                content = document_section_not_found_answer(
-                    decision.section_query,
-                    document=document,
-                )
-                sources = []
-            else:
-                content = document_section_answer(decision.section_query, rows)
-                sources = _unique_citations(rows)
-        return RagAnswer(
-            query=query,
-            answer=content,
-            sources=sources,
-            rows=rows,
-            mode="service",
-            route="document_section",
-            timings_ms=timings,
+        return _answer_document_sections(
+            query,
+            structural_requests,
+            include_descendants=decision.include_descendants,
+            database_url_override=database_url_override,
+            started=started,
+            routing_ms=routing_ms,
         )
     if service_route == "full_document":
         if not decision.document_query:
@@ -341,6 +313,187 @@ def _service_answer(
     )
 
 
+def _resolved_structural_requests(decision: RouteDecision) -> list[dict[str, str]]:
+    reference = decision.resolved_reference or {}
+    reference_type = str(reference.get("reference_type") or "")
+    anchors = reference.get("anchors")
+    selected: list[dict[str, Any]] = []
+    if isinstance(anchors, list) and reference_type == "list_selection":
+        selected = [anchor for anchor in anchors if isinstance(anchor, dict)]
+
+    requests: list[dict[str, str]] = []
+    for anchor in selected:
+        section_query = str(anchor.get("section_query") or "").strip()
+        if not section_query:
+            continue
+        requests.append(
+            {
+                "section_query": section_query,
+                "document_query": str(anchor.get("document_query") or "").strip(),
+            }
+        )
+
+    if (
+        not requests
+        and isinstance(anchors, list)
+        and reference_type == "citation"
+        and decision.route == "document_section"
+    ):
+        citation_anchor = next((anchor for anchor in anchors if isinstance(anchor, dict)), {})
+        section_query = decision.section_query or str(
+            citation_anchor.get("section_query") or ""
+        ).strip()
+        document_query = decision.document_query or str(
+            citation_anchor.get("document_query") or ""
+        ).strip()
+        if section_query:
+            requests.append(
+                {
+                    "section_query": section_query,
+                    "document_query": document_query,
+                }
+            )
+
+    if not requests and decision.route == "document_section" and decision.section_query:
+        requests.append(
+            {
+                "section_query": decision.section_query,
+                "document_query": decision.document_query,
+            }
+        )
+
+    unique: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for request in requests:
+        key = (
+            request["document_query"].casefold(),
+            request["section_query"].casefold(),
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(request)
+    return unique
+
+
+def _citation_ambiguity_answer(reference: dict[str, Any]) -> str:
+    items = reference.get("items")
+    rendered: list[str] = []
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            source_number = item.get("source_number") or item.get("list_label")
+            text = str(item.get("text") or "").strip()
+            if source_number and text:
+                rendered.append(f"{source_number}. Источник [{source_number}]: {text}")
+    if not rendered:
+        return "В предыдущем ответе было несколько источников. Уточните номер источника [N]."
+    return "В предыдущем ответе было несколько ссылок. Уточните источник:\n" + "\n".join(rendered)
+
+
+def _list_selection_ambiguity_answer(reference: dict[str, Any]) -> str:
+    count = int(reference.get("available_count") or 0)
+    if count > 0:
+        return (
+            f"В предыдущем списке {count} вариантов, поэтому слово «оба» неоднозначно. "
+            "Укажите нужные номера или скажите «все»."
+        )
+    return "Не удалось однозначно определить два варианта. Укажите нужные номера."
+
+
+def _answer_document_sections(
+    query: str,
+    requests: list[dict[str, str]],
+    *,
+    include_descendants: bool,
+    database_url_override: str | None,
+    started: float,
+    routing_ms: float,
+) -> RagAnswer:
+    database_started = time.perf_counter()
+    content_blocks: list[str] = []
+    successful_rows: list[dict[str, Any]] = []
+    with connect(database_url(database_url_override)) as conn:
+        acquire_corpus_read_lock(conn)
+        for request in requests:
+            section_query = request["section_query"]
+            document_query = request["document_query"]
+            candidates: list[dict[str, Any]] = []
+            document: dict[str, Any] | None = None
+            if document_query:
+                candidates = find_documents(conn, document_query)
+                document = _select_document(candidates, document_query)
+                rows = (
+                    load_structural_chunks(
+                        conn,
+                        section_query,
+                        doc_id=str(document["doc_id"]),
+                        include_descendants=include_descendants,
+                    )
+                    if document
+                    else []
+                )
+            else:
+                rows = load_structural_chunks(
+                    conn,
+                    section_query,
+                    include_descendants=include_descendants,
+                )
+
+            if document_query and document is None:
+                content_blocks.append(document_not_found_answer(document_query, candidates))
+                continue
+
+            structural_anchors = _distinct_structural_anchors(
+                rows,
+                section_query,
+                include_descendants=include_descendants,
+            )
+            if len(structural_anchors) > 1:
+                content_blocks.append(
+                    document_section_ambiguous_answer(section_query, structural_anchors)
+                )
+            elif not rows:
+                content_blocks.append(
+                    document_section_not_found_answer(section_query, document=document)
+                )
+            else:
+                content_blocks.append(document_section_answer(section_query, rows))
+                successful_rows.extend(rows)
+
+    rows = _deduplicate_rows(successful_rows)
+    timings = {
+        "routing": routing_ms,
+        "database": _elapsed_ms(database_started),
+        "total": _elapsed_ms(started),
+    }
+    return RagAnswer(
+        query=query,
+        answer="\n\n---\n\n".join(content_blocks),
+        sources=_unique_citations(rows),
+        rows=rows,
+        mode="service",
+        route="document_section",
+        timings_ms=timings,
+    )
+
+
+def _deduplicate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, row in enumerate(rows):
+        key = str(row.get("chunk_id") or "")
+        if not key:
+            key = "\x1f".join(
+                str(row.get(field) or "")
+                for field in ("doc_id", "citation_label", "raw_text", "item_number")
+            ) or str(index)
+        if key not in seen:
+            seen.add(key)
+            unique.append(row)
+    return unique
+
+
 def _elapsed_ms(started: float) -> float:
     return round((time.perf_counter() - started) * 1000, 2)
 
@@ -383,7 +536,17 @@ def _answer_documents_by_topic(
             vector_candidates=180,
             text_candidates=180,
         )
-    documents = _documents_from_search_rows(rows, limit=20)
+    documents = rank_documents(
+        rows,
+        limit=int(os.getenv("RAG_DOCUMENT_RESULT_LIMIT") or "12"),
+        min_vector_score=float(os.getenv("RAG_DOCUMENT_MIN_VECTOR_SCORE") or "0.45"),
+        min_text_score=float(os.getenv("RAG_DOCUMENT_MIN_TEXT_SCORE") or "0.01"),
+        min_document_score=float(os.getenv("RAG_DOCUMENT_MIN_SCORE") or "0.05"),
+        relative_cutoff=float(os.getenv("RAG_DOCUMENT_RELATIVE_CUTOFF") or "0.55"),
+        min_competitive_signal=float(
+            os.getenv("RAG_DOCUMENT_MIN_COMPETITIVE_SIGNAL") or "0.25"
+        ),
+    )
     timings = {
         "routing": routing_ms,
         "embedding": embedding_ms,
@@ -399,24 +562,6 @@ def _answer_documents_by_topic(
         route="documents",
         timings_ms=timings,
     )
-
-
-def _documents_from_search_rows(
-    rows: list[dict[str, Any]],
-    *,
-    limit: int,
-) -> list[dict[str, Any]]:
-    documents: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for row in rows:
-        doc_id = str(row.get("doc_id") or row.get("source_name") or "")
-        if not doc_id or doc_id in seen:
-            continue
-        seen.add(doc_id)
-        documents.append(row)
-        if len(documents) >= limit:
-            break
-    return documents
 
 
 def _select_document(
@@ -458,6 +603,8 @@ def _select_document(
 def _distinct_structural_anchors(
     rows: list[dict[str, Any]],
     section_reference: str,
+    *,
+    include_descendants: bool = False,
 ) -> list[dict[str, Any]]:
     anchors: list[dict[str, Any]] = []
     seen: set[tuple[Any, ...]] = set()
@@ -467,13 +614,23 @@ def _distinct_structural_anchors(
             continue
         match_type = str(row.get("structural_match") or "")
         if match_type == "item":
-            block_ids = tuple(str(value) for value in (row.get("block_ids") or []))
-            location: tuple[Any, ...] = (
-                row.get("appendix_number"),
-                tuple(row.get("section_path") or []),
-                row.get("item_number"),
-                block_ids,
-            )
+            if include_descendants:
+                reference = parse_structural_reference(section_reference)
+                root_number = reference.number if reference else section_reference.casefold()
+                location = (
+                    row.get("appendix_number"),
+                    tuple(row.get("section_path") or []),
+                    "item_subtree",
+                    root_number,
+                )
+            else:
+                block_ids = tuple(str(value) for value in (row.get("block_ids") or []))
+                location = (
+                    row.get("appendix_number"),
+                    tuple(row.get("section_path") or []),
+                    row.get("item_number"),
+                    block_ids,
+                )
         elif match_type == "appendix":
             location = (row.get("appendix_number"),)
         elif match_type == "section":

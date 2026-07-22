@@ -56,6 +56,14 @@ openai_api_base_url = (
     or first_env_value("OPENAI_API_BASE_URL", "OPENAI_API_BASE_URLS")
     or "http://host.docker.internal:8000/v1"
 ).rstrip("/")
+external_document_loader_url = (
+    os.environ.get("EXTERNAL_DOCUMENT_LOADER_URL", "").strip()
+    or openai_api_base_url.removesuffix("/v1")
+).rstrip("/")
+external_document_loader_api_key = (
+    os.environ.get("EXTERNAL_DOCUMENT_LOADER_API_KEY", "").strip()
+    or openai_api_key
+)
 
 if not openai_api_key:
     raise SystemExit("OpenAI-compatible API key is missing; persistent config was not changed")
@@ -203,6 +211,15 @@ if {"id", "data"}.issubset(config_columns):
         evaluation["arena"] = arena
     arena["enable"] = False
     arena["models"] = []
+    rag = data.get("rag")
+    if not isinstance(rag, dict):
+        rag = {}
+        data["rag"] = rag
+    rag["content_extraction_engine"] = "external"
+    # Open WebUI <= 0.6 used this exact uppercase legacy config path.
+    rag["CONTENT_EXTRACTION_ENGINE"] = "external"
+    rag["external_document_loader_url"] = external_document_loader_url
+    rag["external_document_loader_api_key"] = external_document_loader_api_key
 
     if row:
         query = "update config set data = ?"
@@ -276,6 +293,9 @@ elif {"key", "value"}.issubset(config_columns):
         "ollama.enable": False,
         "evaluation.arena.enable": False,
         "evaluation.arena.models": [],
+        "rag.content_extraction_engine": "external",
+        "rag.external_document_loader_url": external_document_loader_url,
+        "rag.external_document_loader_api_key": external_document_loader_api_key,
     }.items():
         upsert_key(key, value)
     changed_openai_connection = 1
@@ -428,15 +448,34 @@ if config_schema == "legacy":
         and verified_openai.get("api_base_urls") == [openai_api_base_url]
         and verified_openai.get("api_keys") == [openai_api_key]
     )
+    verified_rag = verified_data.get("rag")
+    document_loader_verified = (
+        isinstance(verified_rag, dict)
+        and verified_rag.get("content_extraction_engine") == "external"
+        and verified_rag.get("CONTENT_EXTRACTION_ENGINE") == "external"
+        and verified_rag.get("external_document_loader_url")
+        == external_document_loader_url
+        and verified_rag.get("external_document_loader_api_key")
+        == external_document_loader_api_key
+    )
 else:
     connection_verified = (
         read_key("openai.enable") is True
         and read_key("openai.api_base_urls") == [openai_api_base_url]
         and read_key("openai.api_keys") == [openai_api_key]
     )
+    document_loader_verified = (
+        read_key("rag.content_extraction_engine") == "external"
+        and read_key("rag.external_document_loader_url")
+        == external_document_loader_url
+        and read_key("rag.external_document_loader_api_key")
+        == external_document_loader_api_key
+    )
 
 if not connection_verified:
     raise SystemExit("Open WebUI persistent OpenAI connection verification failed")
+if not document_loader_verified:
+    raise SystemExit("Open WebUI persistent document loader verification failed")
 
 con.commit()
 
@@ -467,6 +506,7 @@ print(f"config_schema={config_schema}")
 print(f"config_updated={changed_config}")
 print(f"openai_connection_updated={changed_openai_connection}")
 print("openai_connection_verified=1")
+print("external_document_loader_configured=1")
 if verify_upstream:
     print(f"upstream_model_verified={model_id}")
 print(f"models_updated={changed_models}")
@@ -520,7 +560,12 @@ def main() -> None:
         run(["docker", "cp", str(inner), f"{args.container}:/tmp/{inner.name}"])
         run(["docker", "cp", str(config), f"{args.container}:/tmp/{config.name}"])
         command = ["docker", "exec"]
-        for name in ("OPENAI_COMPAT_API_KEY", "OPENAI_COMPAT_API_BASE_URL"):
+        for name in (
+            "OPENAI_COMPAT_API_KEY",
+            "OPENAI_COMPAT_API_BASE_URL",
+            "EXTERNAL_DOCUMENT_LOADER_URL",
+            "EXTERNAL_DOCUMENT_LOADER_API_KEY",
+        ):
             if os.environ.get(name):
                 command.extend(["-e", name])
         command.extend(

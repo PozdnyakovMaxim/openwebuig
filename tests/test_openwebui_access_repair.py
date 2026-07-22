@@ -37,6 +37,7 @@ class OpenWebUIAccessRepairTests(unittest.TestCase):
         legacy_row: bool = True,
         verify_upstream: bool = False,
         api_base_url: str = "http://host.docker.internal:8000/v1/",
+        loader_api_key: str | None = None,
     ) -> tuple[dict, str, Path, int]:
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
@@ -116,9 +117,12 @@ class OpenWebUIAccessRepairTests(unittest.TestCase):
         env.pop("OPENAI_COMPAT_API_BASE_URL", None)
         env.pop("OPENAI_API_KEY", None)
         env.pop("OPENAI_API_KEYS", None)
+        env.pop("EXTERNAL_DOCUMENT_LOADER_API_KEY", None)
         env["OPENAI_API_BASE_URL"] = api_base_url
         if api_key is not None:
             env["OPENAI_API_KEY"] = api_key
+        if loader_api_key is not None:
+            env["EXTERNAL_DOCUMENT_LOADER_API_KEY"] = loader_api_key
 
         result = subprocess.run(
             [sys.executable, str(inner_path), str(config_path)],
@@ -183,8 +187,19 @@ class OpenWebUIAccessRepairTests(unittest.TestCase):
             repaired["openai"]["api_configs"],
             {},
         )
+        self.assertEqual(repaired["rag"]["content_extraction_engine"], "external")
+        self.assertEqual(repaired["rag"]["CONTENT_EXTRACTION_ENGINE"], "external")
+        self.assertEqual(
+            repaired["rag"]["external_document_loader_url"],
+            "http://host.docker.internal:8000",
+        )
+        self.assertEqual(
+            repaired["rag"]["external_document_loader_api_key"],
+            "new-secret-at-least-16",
+        )
         self.assertTrue(repaired["ldap"]["enable"])
         self.assertIn("openai_connection_updated=1", output)
+        self.assertIn("external_document_loader_configured=1", output)
         self.assertIn("openai_connection_verified=1", output)
         self.assertNotIn("new-secret-at-least-16", output)
         self.assertEqual(len(list(db_path.parent.glob("webui.db.backup-*"))), 1)
@@ -197,6 +212,29 @@ class OpenWebUIAccessRepairTests(unittest.TestCase):
 
         self.assertEqual(returncode, 0, output)
         self.assertEqual(repaired["openai.api_keys"], ["new-secret-at-least-16"])
+
+    def test_dedicated_document_loader_key_is_persisted_separately(self) -> None:
+        repaired, output, _, returncode = self.run_inner(
+            api_key="compat-secret-at-least-16",
+            config_schema="per-key",
+            loader_api_key="loader-secret-at-least-16",
+        )
+
+        self.assertEqual(returncode, 0, output)
+        self.assertEqual(repaired["openai.api_keys"], ["compat-secret-at-least-16"])
+        self.assertEqual(
+            repaired["rag.external_document_loader_api_key"],
+            "loader-secret-at-least-16",
+        )
+        self.assertNotIn("loader-secret-at-least-16", output)
+
+    def test_repair_shell_reads_and_forwards_dedicated_loader_key(self) -> None:
+        repair_script = (ROOT / "scripts" / "repair_openwebui_access.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('loader_api_key="${OPENWEBUI_DOCUMENT_LOADER_API_KEY:-}"', repair_script)
+        self.assertIn('EXTERNAL_DOCUMENT_LOADER_API_KEY="$loader_api_key"', repair_script)
 
     def test_inserts_missing_legacy_config_row(self) -> None:
         repaired, output, db_path, returncode = self.run_inner(
@@ -244,6 +282,15 @@ class OpenWebUIAccessRepairTests(unittest.TestCase):
         self.assertEqual(
             repaired["openai.api_configs"],
             {},
+        )
+        self.assertEqual(repaired["rag.content_extraction_engine"], "external")
+        self.assertEqual(
+            repaired["rag.external_document_loader_url"],
+            "http://host.docker.internal:8000",
+        )
+        self.assertEqual(
+            repaired["rag.external_document_loader_api_key"],
+            "new-secret-at-least-16",
         )
         self.assertTrue(repaired["ldap.enable"])
         self.assertEqual(repaired["ui.default_models"], "document-search-rag")
