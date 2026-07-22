@@ -4,6 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 import unittest
+from unittest.mock import patch
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from docx import Document
@@ -606,6 +607,30 @@ class ExtractionPipelineTest(unittest.TestCase):
                 sum(chunk["raw_text"].count(text) for chunk in chunked["chunks"]),
                 1,
             )
+
+    def test_raw_document_xml_recovers_textbox_hidden_from_python_docx(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            source_path = Path(temporary_directory) / "raw-textbox.docx"
+            document = Document()
+            document.add_paragraph("Основной текст документа.")
+            document.save(source_path)
+            _inject_supplemental_stories(source_path)
+
+            with patch(
+                "document_search.extractor._source_story_inventory",
+                return_value=[],
+            ):
+                extracted = extract_docx(source_path).to_dict()
+
+        recovered = [
+            block
+            for block in extracted["blocks"]
+            if block["kind"] == "supplemental"
+            and block["source_story"] == "body"
+            and block["source_locations"] == ["textbox"]
+        ]
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["text"], "Текст внутри текстового поля.")
 
     def test_skipped_body_content_control_cannot_be_masked_by_metadata_tokens(self) -> None:
         with TemporaryDirectory() as temporary_directory:
