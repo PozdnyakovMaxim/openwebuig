@@ -709,6 +709,30 @@ def _structured_inventory_segments(data: dict[str, Any]) -> list[str]:
     return result
 
 
+def _structured_critical_inventory_counts(
+    data: dict[str, Any],
+) -> Counter[tuple[str, ...]]:
+    """Count extracted note/textbox occurrences without conflating plain duplicates."""
+
+    counts: Counter[tuple[str, ...]] = Counter()
+    for block in data.get("blocks") or []:
+        if str(block.get("kind") or "") != "supplemental":
+            continue
+        story = str(block.get("source_story") or "")
+        locations = {str(value) for value in (block.get("source_locations") or [])}
+        if story not in {"footnote", "endnote"} and "textbox" not in locations:
+            continue
+        key = tuple(_tokens(_normalize_source_text(str(block.get("text") or ""))))
+        if not key:
+            continue
+        occurrences = max(1, int(block.get("source_occurrences") or 1))
+        # Footnotes/endnotes are critical stories in their entirety. A body
+        # group may combine a textbox with equal ordinary paragraphs, so only
+        # one occurrence can safely be attributed to the textbox itself.
+        counts[key] += occurrences if story in {"footnote", "endnote"} else 1
+    return counts
+
+
 def _source_inventory_metrics(
     inventory: dict[str, Any],
     extracted_data: dict[str, Any],
@@ -741,8 +765,10 @@ def _source_inventory_metrics(
         source_by_key[key].append(segment)
 
     actual_token_segments = [_tokens(segment) for segment in actual_segments]
+    actual_critical_counts = _structured_critical_inventory_counts(extracted_data)
     missing_segment_samples: list[dict[str, Any]] = []
     critical_missing_segments = 0
+    actionable_missing_segments = 0
     missing_segment_occurrences = 0
     for key, examples in source_by_key.items():
         expected_count = sum(
@@ -756,21 +782,27 @@ def _source_inventory_metrics(
         missing_count = max(0, expected_count - actual_count)
         if not missing_count:
             continue
-        critical = any(
-            item.story in {"footnote", "endnote"} or item.location == "textbox"
+        critical_examples = [
+            item
             for item in examples
+            if item.story in {"footnote", "endnote"} or item.location == "textbox"
+        ]
+        critical_missing_count = max(
+            0,
+            len(critical_examples) - actual_critical_counts[tuple(key)],
         )
-        if not critical and not any(missing_tokens[token] for token in key):
+        novel_missing_count = missing_count if actual_count == 0 else 0
+        actionable_count = max(critical_missing_count, novel_missing_count)
+        if not actionable_count:
             continue
-        missing_segment_occurrences += missing_count
-        if critical:
-            critical_missing_segments += missing_count
+        missing_segment_occurrences += actionable_count
+        actionable_missing_segments += actionable_count
+        critical_missing_segments += critical_missing_count
         if len(missing_segment_samples) < 30:
             example = next(
                 (
                     item
-                    for item in examples
-                    if item.story in {"footnote", "endnote"} or item.location == "textbox"
+                    for item in critical_examples
                 ),
                 examples[0],
             )
@@ -780,7 +812,7 @@ def _source_inventory_metrics(
                     "story": example.story,
                     "location": example.location,
                     "text": example.text[:320],
-                    "missing_occurrences": missing_count,
+                    "missing_occurrences": actionable_count,
                 }
             )
 
@@ -796,6 +828,7 @@ def _source_inventory_metrics(
         "source_vocabulary_coverage": round(coverage, 4),
         "source_missing_token_counts": dict(missing_tokens.most_common(50)),
         "source_missing_segment_occurrences": missing_segment_occurrences,
+        "source_actionable_missing_segments": actionable_missing_segments,
         "source_critical_missing_segments": critical_missing_segments,
         "source_missing_segment_samples": missing_segment_samples,
     }
@@ -1131,8 +1164,11 @@ def _audit_document(
         report.update(inventory_metrics)
         coverage = float(inventory_metrics["source_token_coverage"])
         missing_tokens = int(inventory_metrics["source_missing_tokens"])
+        actionable_missing = int(
+            inventory_metrics["source_actionable_missing_segments"]
+        )
         critical_missing = int(inventory_metrics["source_critical_missing_segments"])
-        if missing_tokens or critical_missing:
+        if actionable_missing or critical_missing:
             level = (
                 "error"
                 if critical_missing or coverage < SOURCE_TEXT_ERROR_COVERAGE
@@ -1154,6 +1190,7 @@ def _audit_document(
                     "missing_segment_occurrences": inventory_metrics[
                         "source_missing_segment_occurrences"
                     ],
+                    "actionable_missing_segments": actionable_missing,
                     "critical_missing_segments": critical_missing,
                     "segment_samples": inventory_metrics["source_missing_segment_samples"],
                     "story_counts": inventory_metrics["source_story_counts"],

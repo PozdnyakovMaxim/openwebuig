@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+docs_dir="${DOCS_DIR:-$HOME/rag_template/docs}"
+expected_documents="${EXPECTED_DOCUMENTS:-41}"
+candidate_dir="artifacts/candidate-$(date +%Y%m%d-%H%M%S)"
+backup_dir="${BACKUP_DIR:-$HOME/document-search-backups}"
+backup_file="$backup_dir/document_search-before-reindex-$(date +%Y%m%d-%H%M%S).dump"
+
+install -d -m 700 "$backup_dir"
+umask 077
+sudo docker exec document-search-postgres pg_dump \
+  -U postgres -d document_search -Fc >"$backup_file"
+chmod 600 "$backup_file"
+echo "Backup: $backup_file"
+
+.venv/bin/python scripts/step3_init_pgvector.py --embedding-dim 1024
+.venv/bin/python scripts/rebuild_corpus_candidate.py \
+  --docs-dir "$docs_dir" \
+  --output-dir "$candidate_dir" \
+  --expected-documents "$expected_documents"
+.venv/bin/python scripts/audit_rag_corpus.py \
+  --docs-dir "$docs_dir" \
+  --extracted-dir "$candidate_dir/extracted" \
+  --chunks-dir "$candidate_dir/chunks" \
+  --skip-database \
+  --strict \
+  --certify-candidate \
+  --report "$candidate_dir/audit-before.json"
+.venv/bin/python scripts/step3_index_chunks.py \
+  --input-dir "$candidate_dir/chunks" \
+  --embedding-dim 1024 \
+  --batch-size 8 \
+  --expected-documents "$expected_documents" \
+  --atomic \
+  --replace-corpus
+
+sudo systemctl restart document-search-rag-api
+sleep 8
+curl -f http://127.0.0.1:8000/health
+echo
+echo "Corpus rebuild completed: $candidate_dir"
