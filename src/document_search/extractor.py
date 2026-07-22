@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 from typing import Any, Iterable
+from zipfile import ZipFile
 
 from docx import Document
 from docx.document import Document as DocumentObject
@@ -598,6 +599,52 @@ def _source_story_inventory(doc: DocumentObject) -> list[SourceStorySegment]:
     return _filter_source_story_segments(segments)
 
 
+def _raw_body_textbox_segments(source_bytes: bytes) -> list[SourceStorySegment]:
+    """Recover textboxes that python-docx can omit while materializing document.xml."""
+
+    with ZipFile(BytesIO(source_bytes)) as archive:
+        root = parse_xml(archive.read("word/document.xml"))
+    return [
+        segment
+        for segment in _story_paragraph_segments(
+            root,
+            part_name="word/document.xml",
+            story="body",
+        )
+        if segment.location == "textbox"
+    ]
+
+
+def _merge_missing_story_segments(
+    primary: list[SourceStorySegment],
+    recovered: list[SourceStorySegment],
+) -> list[SourceStorySegment]:
+    combined = list(primary)
+    remaining = Counter(
+        (
+            segment.part,
+            segment.story,
+            _normalize_text(segment.text),
+            segment.style,
+            segment.location,
+        )
+        for segment in primary
+    )
+    for segment in recovered:
+        key = (
+            segment.part,
+            segment.story,
+            _normalize_text(segment.text),
+            segment.style,
+            segment.location,
+        )
+        if remaining[key]:
+            remaining[key] -= 1
+            continue
+        combined.append(segment)
+    return combined
+
+
 def _story_paragraph_segments(
     root: Any,
     *,
@@ -857,8 +904,15 @@ def _supplemental_content_blocks(
     doc: DocumentObject,
     _metadata: DocumentMetadata,
     blocks: list[ContentBlock],
+    *,
+    source_bytes: bytes | None = None,
 ) -> list[ContentBlock]:
     segments = _source_story_inventory(doc)
+    if source_bytes is not None:
+        segments = _merge_missing_story_segments(
+            segments,
+            _raw_body_textbox_segments(source_bytes),
+        )
     grouped: dict[tuple[str, str], list[SourceStorySegment]] = defaultdict(list)
     for segment in segments:
         grouped[(segment.story, _normalize_text(segment.text))].append(segment)
@@ -1424,7 +1478,14 @@ def extract_docx(
                 )
             )
 
-    blocks.extend(_supplemental_content_blocks(doc, metadata, blocks))
+    blocks.extend(
+        _supplemental_content_blocks(
+            doc,
+            metadata,
+            blocks,
+            source_bytes=source_bytes,
+        )
+    )
     _ensure_unique_block_ids(blocks)
     return StructuredDocument(metadata=metadata, blocks=blocks)
 
