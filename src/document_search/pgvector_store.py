@@ -441,11 +441,30 @@ def load_structural_chunks(
         if reference.appendix_number:
             predicate = f"({predicate}) AND appendix_number = %s"
             parameters.append(reference.appendix_number)
-        return _load_structural_match(
+        rows = _load_structural_match(
             conn,
             predicate=predicate,
             parameters=parameters,
             match_type="item",
+            doc_id=doc_id,
+        )
+        if rows:
+            return rows
+        # Corporate DOCX files often style a numbered clause as a heading even
+        # when users naturally call it a "пункт". Keep the explicit item lookup
+        # first, then accept the identical structural number as a section.
+        section_predicate = (
+            "(heading_number = %s OR section_path @> ARRAY[%s]::text[])"
+        )
+        section_parameters = [reference.number, reference.number]
+        if reference.appendix_number:
+            section_predicate += " AND appendix_number = %s"
+            section_parameters.append(reference.appendix_number)
+        return _load_structural_match(
+            conn,
+            predicate=section_predicate,
+            parameters=section_parameters,
+            match_type="section",
             doc_id=doc_id,
         )
 

@@ -165,6 +165,28 @@ class StructuralLookupTest(unittest.TestCase):
         self.assertNotIn("section_path @>", query)
         self.assertEqual(parameters, ("2.3",))
 
+    def test_prefixed_item_falls_back_to_same_numbered_section(self) -> None:
+        expected = [
+            {
+                "chunk_id": "doc::chunk-0025",
+                "raw_text": "2.5.5 Требования к резервному копированию",
+            }
+        ]
+        conn = SequencedConnection([[], expected])
+
+        rows = load_structural_chunks(conn, "пункт 2.5.5", doc_id="policy")
+
+        self.assertEqual(rows, expected)
+        self.assertEqual(len(conn.calls), 2)
+        first_query, first_parameters = conn.calls[0]
+        second_query, second_parameters = conn.calls[1]
+        self.assertIn("item_number = %s", first_query)
+        self.assertEqual(first_parameters, ("2.5.5", "policy"))
+        self.assertIn("heading_number = %s", second_query)
+        self.assertIn("section_path @> ARRAY[%s]::text[]", second_query)
+        self.assertIn("'section' AS structural_match", second_query)
+        self.assertEqual(second_parameters, ("2.5.5", "2.5.5", "policy"))
+
     def test_prefixed_section_reference_loads_only_section_subtree(self) -> None:
         conn = RecordingConnection()
 
