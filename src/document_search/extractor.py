@@ -8,8 +8,6 @@ import hashlib
 import json
 import re
 from typing import Any, Iterable
-from zipfile import ZipFile
-
 from docx import Document
 from docx.document import Document as DocumentObject
 from docx.oxml import parse_xml
@@ -18,6 +16,8 @@ from docx.oxml.table import CT_Tbl
 from docx.oxml.text.paragraph import CT_P
 from docx.table import Table
 from docx.text.paragraph import Paragraph
+
+from .ooxml_source import source_ooxml_inventory
 
 
 DATE_RE = re.compile(r"\b\d{2}\.\d{2}\.\d{4}\b")
@@ -599,52 +599,6 @@ def _source_story_inventory(doc: DocumentObject) -> list[SourceStorySegment]:
     return _filter_source_story_segments(segments)
 
 
-def _raw_body_textbox_segments(source_bytes: bytes) -> list[SourceStorySegment]:
-    """Recover textboxes that python-docx can omit while materializing document.xml."""
-
-    with ZipFile(BytesIO(source_bytes)) as archive:
-        root = parse_xml(archive.read("word/document.xml"))
-    return [
-        segment
-        for segment in _story_paragraph_segments(
-            root,
-            part_name="word/document.xml",
-            story="body",
-        )
-        if segment.location == "textbox"
-    ]
-
-
-def _merge_missing_story_segments(
-    primary: list[SourceStorySegment],
-    recovered: list[SourceStorySegment],
-) -> list[SourceStorySegment]:
-    combined = list(primary)
-    remaining = Counter(
-        (
-            segment.part,
-            segment.story,
-            _normalize_text(segment.text),
-            segment.style,
-            segment.location,
-        )
-        for segment in primary
-    )
-    for segment in recovered:
-        key = (
-            segment.part,
-            segment.story,
-            _normalize_text(segment.text),
-            segment.style,
-            segment.location,
-        )
-        if remaining[key]:
-            remaining[key] -= 1
-            continue
-        combined.append(segment)
-    return combined
-
-
 def _story_paragraph_segments(
     root: Any,
     *,
@@ -901,19 +855,16 @@ def _primary_body_inventory_segments(
 
 
 def _supplemental_content_blocks(
-    doc: DocumentObject,
+    _doc: DocumentObject,
     _metadata: DocumentMetadata,
     blocks: list[ContentBlock],
     *,
     source_bytes: bytes | None = None,
 ) -> list[ContentBlock]:
-    segments = _source_story_inventory(doc)
-    if source_bytes is not None:
-        segments = _merge_missing_story_segments(
-            segments,
-            _raw_body_textbox_segments(source_bytes),
-        )
-    grouped: dict[tuple[str, str], list[SourceStorySegment]] = defaultdict(list)
+    if source_bytes is None:
+        raise ValueError("source_bytes are required for canonical OOXML inventory")
+    segments = source_ooxml_inventory(source_bytes)["segments"]
+    grouped: dict[tuple[str, str], list[Any]] = defaultdict(list)
     for segment in segments:
         grouped[(segment.story, _normalize_text(segment.text))].append(segment)
 
@@ -922,7 +873,7 @@ def _supplemental_content_blocks(
 
     def add_group(
         key: tuple[str, str],
-        examples: list[SourceStorySegment],
+        examples: list[Any],
         occurrences: int,
     ) -> None:
         story, text = key
@@ -943,8 +894,14 @@ def _supplemental_content_blocks(
 
     for key in sorted(grouped):
         examples = grouped[key]
-        if key[0] != "body" or any(item.location == "textbox" for item in examples):
+        if key[0] != "body":
             add_group(key, examples, len(examples))
+            continue
+        textbox_examples = [
+            item for item in examples if item.location == "textbox"
+        ]
+        if textbox_examples:
+            add_group(key, textbox_examples, len(textbox_examples))
 
     primary_body_segments = _primary_body_inventory_segments(blocks)
     primary_exact = Counter(

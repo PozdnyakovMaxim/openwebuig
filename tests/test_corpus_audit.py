@@ -16,6 +16,23 @@ from document_search.extractor import extract_docx, write_extraction
 
 
 class CorpusAuditTest(unittest.TestCase):
+    def test_audit_delegates_to_shared_ooxml_inventory(self) -> None:
+        expected = {
+            "segments": [],
+            "ignored_segments": [],
+            "story_counts": {},
+            "location_counts": {},
+        }
+
+        with patch(
+            "document_search.corpus_audit.source_ooxml_inventory",
+            return_value=expected,
+        ) as inventory:
+            actual = corpus_audit_module._source_ooxml_inventory(Path("sample.docx"))
+
+        self.assertIs(actual, expected)
+        inventory.assert_called_once_with(Path("sample.docx"))
+
     def test_plain_duplicate_does_not_create_a_false_missing_textbox_error(self) -> None:
         text = "КОММЕРЧЕСКАЯ ТАЙНА"
         inventory = {
