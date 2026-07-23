@@ -14,6 +14,7 @@ from docx.oxml.ns import qn
 
 from document_search.chunker import chunk_document
 from document_search.extractor import extract_docx, extract_docx_text
+from document_search.ooxml_source import SourceTextSegment
 
 
 def _value_element(tag: str, value: object) -> Any:
@@ -654,6 +655,61 @@ class ExtractionPipelineTest(unittest.TestCase):
         self.assertEqual(recovered[0]["text"], "КОММЕРЧЕСКАЯ ТАЙНА")
         self.assertEqual(full_text.count("1.4 Основные принципы"), 1)
         self.assertEqual(full_text.count("КОММЕРЧЕСКАЯ ТАЙНА"), 1)
+
+    def test_supplemental_blocks_use_shared_inventory_contract(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            source_path = Path(temporary_directory) / "shared-inventory.docx"
+            document = Document()
+            document.add_paragraph("Основной текст.")
+            document.save(source_path)
+            inventory = {
+                "segments": [
+                    SourceTextSegment(
+                        part="word/document.xml",
+                        story="body",
+                        text="Текст только из общего инвентаря.",
+                        location="textbox",
+                    )
+                ],
+                "ignored_segments": [],
+                "story_counts": {"body": 1},
+                "location_counts": {"textbox": 1},
+            }
+
+            with patch(
+                "document_search.extractor.source_ooxml_inventory",
+                return_value=inventory,
+            ) as shared_inventory:
+                extracted = extract_docx(source_path).to_dict()
+
+        matching = [
+            block
+            for block in extracted["blocks"]
+            if block["kind"] == "supplemental"
+            and block["text"] == "Текст только из общего инвентаря."
+        ]
+        self.assertEqual(len(matching), 1)
+        shared_inventory.assert_called_once()
+        self.assertIsInstance(shared_inventory.call_args.args[0], bytes)
+
+    def test_duplicate_body_and_textbox_text_keeps_exact_source_occurrences(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            source_path = Path(temporary_directory) / "duplicate-textbox.docx"
+            document = Document()
+            document.add_paragraph("КОММЕРЧЕСКАЯ ТАЙНА")
+            document.save(source_path)
+            _inject_real_textbox(source_path, "КОММЕРЧЕСКАЯ ТАЙНА")
+
+            extracted = extract_docx(source_path).to_dict()
+
+        supplemental = next(
+            block
+            for block in extracted["blocks"]
+            if block["kind"] == "supplemental"
+            and block["text"] == "КОММЕРЧЕСКАЯ ТАЙНА"
+        )
+        self.assertEqual(supplemental["source_locations"], ["textbox"])
+        self.assertEqual(supplemental["source_occurrences"], 1)
 
     def test_skipped_body_content_control_cannot_be_masked_by_metadata_tokens(self) -> None:
         with TemporaryDirectory() as temporary_directory:
