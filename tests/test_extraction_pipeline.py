@@ -632,6 +632,29 @@ class ExtractionPipelineTest(unittest.TestCase):
         self.assertEqual(len(recovered), 1)
         self.assertEqual(recovered[0]["text"], "Текст внутри текстового поля.")
 
+    def test_shared_ooxml_inventory_recovers_real_textbox_and_numbers(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            source_path = Path(temporary_directory) / "instruction-kt.docx"
+            document = Document()
+            document.add_paragraph("1.4 Основные принципы")
+            document.save(source_path)
+            _inject_real_textbox(source_path, "КОММЕРЧЕСКАЯ ТАЙНА")
+
+            extracted = extract_docx(source_path).to_dict()
+            full_text = extract_docx_text(source_path)
+
+        recovered = [
+            block
+            for block in extracted["blocks"]
+            if block["kind"] == "supplemental"
+            and block["source_story"] == "body"
+            and block["source_locations"] == ["textbox"]
+        ]
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["text"], "КОММЕРЧЕСКАЯ ТАЙНА")
+        self.assertEqual(full_text.count("1.4 Основные принципы"), 1)
+        self.assertEqual(full_text.count("КОММЕРЧЕСКАЯ ТАЙНА"), 1)
+
     def test_skipped_body_content_control_cannot_be_masked_by_metadata_tokens(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             source_path = Path(temporary_directory) / "body-content-control.docx"
@@ -742,6 +765,27 @@ def _inject_body_content_control(path: Path, text: str) -> None:
         "</w:t></w:r></w:p></w:sdtContent></w:sdt>"
     )
     document_xml = document_xml.replace("<w:sectPr", f"{content_control}<w:sectPr", 1)
+    files["word/document.xml"] = document_xml.encode("utf-8")
+
+    temporary_path = path.with_suffix(".rewrite.docx")
+    with ZipFile(temporary_path, "w", ZIP_DEFLATED) as destination:
+        for name, payload in files.items():
+            destination.writestr(name, payload)
+    temporary_path.replace(path)
+
+
+def _inject_real_textbox(path: Path, text: str) -> None:
+    with ZipFile(path) as source:
+        files = {item.filename: source.read(item.filename) for item in source.infolist()}
+
+    document_xml = files["word/document.xml"].decode("utf-8")
+    textbox = (
+        '<w:p><w:r><w:pict><v:shape xmlns:v="urn:schemas-microsoft-com:vml">'
+        "<v:textbox><w:txbxContent><w:p><w:r><w:t>"
+        f"{text}"
+        "</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>"
+    )
+    document_xml = document_xml.replace("<w:sectPr", f"{textbox}<w:sectPr", 1)
     files["word/document.xml"] = document_xml.encode("utf-8")
 
     temporary_path = path.with_suffix(".rewrite.docx")
