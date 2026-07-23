@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass
 import json
 from pathlib import Path
 import posixpath
@@ -12,6 +11,7 @@ from zipfile import BadZipFile, ZipFile
 
 from .chunker import DEFAULT_MAX_CHARS, chunk_document
 from .extractor import extract_docx
+from .ooxml_source import SourceTextSegment, source_ooxml_inventory
 from .pgvector_store import connect, database_url, redact_url
 
 
@@ -22,16 +22,6 @@ MARKUP_COMPATIBILITY_NS = "http://schemas.openxmlformats.org/markup-compatibilit
 W = f"{{{WORDPROCESSINGML_NS}}}"
 MC = f"{{{MARKUP_COMPATIBILITY_NS}}}"
 SOURCE_TEXT_ERROR_COVERAGE = 0.98
-
-
-@dataclass(frozen=True)
-class SourceTextSegment:
-    part: str
-    story: str
-    text: str
-    style: str = ""
-    location: str = "paragraph"
-    has_dynamic_page_field: bool = False
 
 
 def audit_corpus(
@@ -275,44 +265,9 @@ def _source_files(directory: Path) -> list[Path]:
 
 
 def _source_ooxml_inventory(source_path: Path) -> dict[str, Any]:
-    """Read visible WordprocessingML text without using python-docx or the extractor."""
+    """Delegate source-side parsing to the canonical OOXML inventory."""
 
-    segments: list[SourceTextSegment] = []
-    try:
-        with ZipFile(source_path) as archive:
-            names = set(archive.namelist())
-            if "word/document.xml" not in names:
-                raise ValueError("word/document.xml is missing")
-            document_root = _read_ooxml_part(archive, "word/document.xml")
-            segments.extend(
-                _ooxml_paragraph_segments(document_root, "word/document.xml", "body")
-            )
-            for part_name, story, note_ids in _referenced_story_parts(
-                archive,
-                names,
-                document_root,
-            ):
-                root = _read_ooxml_part(archive, part_name)
-                segments.extend(
-                    _ooxml_paragraph_segments(
-                        root,
-                        part_name,
-                        story,
-                        note_ids=note_ids,
-                    )
-                )
-    except (BadZipFile, KeyError, OSError, ValueError) as exc:
-        raise ValueError(f"cannot inventory DOCX OOXML: {exc}") from exc
-
-    required, ignored = _partition_source_segments(segments)
-    story_counts = Counter(segment.story for segment in required)
-    location_counts = Counter(segment.location for segment in required)
-    return {
-        "segments": required,
-        "ignored_segments": ignored,
-        "story_counts": dict(sorted(story_counts.items())),
-        "location_counts": dict(sorted(location_counts.items())),
-    }
+    return source_ooxml_inventory(source_path)
 
 
 def _read_ooxml_part(archive: ZipFile, part_name: str) -> ElementTree.Element:
